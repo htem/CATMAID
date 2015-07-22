@@ -1,506 +1,553 @@
-/**
- * simple slider
- */
+(function(CATMAID) {
 
-var SLIDER_HORIZONTAL = 0;
-var SLIDER_VERTICAL = 1;
+  "use strict";
 
-/**
- * a vertical or horizontal slider
- *
- * it is possible to instantiate the slider by the values min, max and steps or
- * with an array steps containing all possible values
- * internally a steps-array is created for both constructors
- */
-Slider = function(
-  type,     //!< SLIDER_HORIZONTAL | SLIDER_VERTICAL
-  input,    //!< create an input or not
-  min,      //!< the minimal value
-  max,      //!< the maximal value
-  steps,    //!< number of steps or an array of values
-  def,      //!< default value
-  onchange,  //!< method to call
-  split     //!< split value
-  )
-{
+  /**
+   * a vertical or horizontal slider
+   *
+   * it is possible to instantiate the slider by the values min, max and steps or
+   * with an array steps containing all possible values
+   * internally a steps-array is created for both constructors
+   */
+  function Slider(
+    type,     //!< Slider.HORIZONTAL | Slider.VERTICAL
+    input,    //!< create an input or not
+    min,      //!< the minimal value
+    max,      //!< the maximal value
+    steps,    //!< number of steps, an array of values,
+              //!< or an object literal of either for major and minor steps
+    def,      //!< default value
+    onchange, //!< method to call
+    split,    //!< split value
+    forceSnap,//!< whether to force input to snap to indexed values
+    minMove   //!< a required minimum change when calling move
+    )
+  {
+    if ( type != Slider.HORIZONTAL ) type = Slider.VERTICAL;
+    this._type = type;
+    this._timer = false;
+
+    this._virtualHandlePos = 0; // Handle position when dragging as pixels
+    this._handlePos = 0; // Handle position as percentage of slider
+
+    this._values = [];
+    this._majorValues = [];
+    this._ind = 0;  //!< the current index
+    this.val = undefined;     //!< the current value
+    this._splitIndex = 0; //!< index where to change div class
+    if ( typeof forceSnap === 'undefined' ) forceSnap = true;
+    this._forceSnap = forceSnap;
+    this._minMove = minMove;
+
+    this._view = document.createElement( "div" );
+    this._barTop = document.createElement( "div" );
+    this._barBottom = document.createElement( "div" );
+    this._handle = document.createElement( "div" );
+
+    this._barSize = false;
+
+    this._handle.onmousedown = this._handleMouseDown.bind(this);
+    this._barTop.onmousedown = this._barMouseDown.bind(this, -1);
+    this._barBottom.onmousedown = this._barMouseDown.bind(this, 1);
+
+    switch ( type )
+    {
+    case Slider.VERTICAL:
+      this._view.className = "vSliderView";
+      this._barTop.className = "vSliderBarTop";
+      this._barBottom.className = "vSliderBarBottom";
+      this._handle.className = "vSliderHandle";
+      break;
+    case Slider.HORIZONTAL:
+      this._view.className = "hSliderView";
+      this._barTop.className = "hSliderBarTop";
+      this._barBottom.className = "hSliderBarBottom";
+      this._handle.className = "hSliderHandle";
+      break;
+    }
+
+    this._view.appendChild( this._barTop );
+    this._view.appendChild( this._handle );
+    this._view.appendChild( this._barBottom );
+
+    // Pre-beind handler for event release. This is necessary because otherwise
+    // CATMAID.ui.removeEvent will not recognize methods bound at different times
+    // as equal.
+    this._boundHandleMove = this._handleMove.bind(this);
+    this._boundHandleMouseUp = this._handleMouseUp.bind(this);
+    this._boundBarMouseUp = this._barMouseUp.bind(this);
+
+    if ( input )
+    {
+      var name = CATMAID.tools.uniqueId();
+
+      this._inputView = document.createElement( "p" );
+      this._inputView.style.paddingLeft = "0.5em";
+      this._input = document.createElement( "input" );
+      this._input.type = "text";
+      this._input.size = "3";
+      this._input.id = this._input.name = name;
+
+      var map = document.createElement( "map" );
+      map.id = map.name = "map_" + name;
+      var area1 = document.createElement( "area" );
+      area1.shape = "rect";
+      area1.coords = "0,0,13,9";
+      area1.alt = "+";
+      var area2 = document.createElement( "area" );
+      area2.shape = "rect";
+      area2.coords = "0,10,13,18";
+      area2.alt = "-";
+
+      switch ( type )
+      {
+      case Slider.HORIZONTAL:
+        area1.onmousedown = this._barMouseDown.bind(this, 1);
+        area2.onmousedown = this._barMouseDown.bind(this, -1);
+        break;
+      case Slider.VERTICAL:
+        area1.onmousedown = this._barMouseDown.bind(this, -1);
+        area2.onmousedown = this._barMouseDown.bind(this, 1);
+        break;
+      }
+
+      area1.onmouseup = this._boundBarMouseUp;
+      area2.onmouseup = this._boundBarMouseUp;
+
+      map.appendChild( area1 );
+      map.appendChild( area2 );
+
+      var img = document.createElement( "img" );
+      img.src = STATIC_URL_JS + "images/input_topdown.svg";
+      img.setAttribute('onerror', 'this.onerror=null;this.src="' +
+        STATIC_URL_JS + 'images/input_topdown.gif";');
+      img.alt = "";
+      img.useMap = "#map_" + name;
+
+      this._inputView.appendChild( map );
+      this._inputView.appendChild( this._input );
+      this._inputView.appendChild( img );
+
+      this._inputView.style.display = "none";
+      this._inputView.style.display = "block";
+
+      this._input.onchange = this._setByInputHandler();
+      this._input.addEventListener( "wheel", this._mouseWheel.bind(this), false );
+    }
+
+    this._view.addEventListener( "wheel", this._mouseWheel.bind(this), false );
+
+    this.update(min, max, steps, def, onchange, split);
+  }
+
+  Slider.prototype = {};
+  Slider.prototype.constructor = Slider;
+
+  Slider.HORIZONTAL = 0;
+  Slider.VERTICAL = 1;
+
   /**
    * returns the slider-element for insertion to the document
    */
-  this.getView = function()
+  Slider.prototype.getView = function()
   {
-    return view;
+    return this._view;
   };
-  
+
   /**
    * returns the input-element for insertion to the document
    */
-  this.getInputView = function()
+  Slider.prototype.getInputView = function()
   {
-    return inputView;
+    return this._inputView;
   };
-  
+
   /**
    * set a value by its index in the value array
    */
-  var setByIndex = function( i, cancelOnchange )
+  Slider.prototype._setByIndex = function( i, cancelOnchange )
   {
-    if ( values.length > 1 )
-      handlePos = 100 * i / ( values.length - 1 );
-    else
-      handlePos = 0;
-    switch ( type )
-    {
-    case SLIDER_VERTICAL:
-      handle.style.height = handlePos + "%";
-      barTop.style.height = handlePos + "%";
-      barBottom.style.height = ( 100 - handlePos ) + "px";
-      // select CSS class
-      if (i < splitIndex) {
-        barTop.className = "vSliderBarTop";
-        barBottom.className = "vSliderBarBottom";
-      } else {
-        barTop.className = "vSliderBarTop_2";
-        barBottom.className = "vSliderBarBottom_2";
-      }
-      break;
-    case SLIDER_HORIZONTAL:
-      handle.style.left = handlePos + "%";
-      barTop.style.width = handlePos + "%";
-      barBottom.style.width = ( 100 - handlePos ) + "%";
-      // select CSS class
-      if (i < splitIndex) {
-        barTop.className = "hSliderBarTop";
-        barBottom.className = "hSliderBarBottom";
-      } else {
-        barTop.className = "hSliderBarTop_2";
-        barBottom.className = "hSliderBarBottom_2";
-      }
-      break;
-    }
-    self.val = values[ i ];
-    if ( input )
-    {
-      input.value = self.val;
-    }
-    ind = i;
-    
-    if ( !cancelOnchange ) self.onchange( self.val );
-    
-    return;
+    this.setByValue( this._values[ i ], cancelOnchange );
   };
-  
+
+  /**
+   * set the handle position based on the slider value
+   *
+   * param {number} index Index of the value to move to, may be nonintegral
+   */
+  Slider.prototype._setHandle = function (index)
+  {
+    if ( this._values.length > 1 )
+      this._handlePos = 100 * index / ( this._values.length - 1 );
+    else
+      this._handlePos = 0;
+
+    switch ( this._type )
+    {
+    case Slider.VERTICAL:
+      this._handle.style.height = this._handlePos + "%";
+      this._barTop.style.height = this._handlePos + "%";
+      this._barBottom.style.height = ( 100 - this._handlePos ) + "px";
+      // select CSS class
+      if (index < this._splitIndex) {
+        this._barTop.className = "vSliderBarTop";
+        this._barBottom.className = "vSliderBarBottom";
+      } else {
+        this._barTop.className = "vSliderBarTop_2";
+        this._barBottom.className = "vSliderBarBottom_2";
+      }
+      break;
+    case Slider.HORIZONTAL:
+      this._handle.style.left = this._handlePos + "%";
+      this._barTop.style.width = this._handlePos + "%";
+      this._barBottom.style.width = ( 100 - this._handlePos ) + "%";
+      // select CSS class
+      if (index < this._splitIndex) {
+        this._barTop.className = "hSliderBarTop";
+        this._barBottom.className = "hSliderBarBottom";
+      } else {
+        this._barTop.className = "hSliderBarTop_2";
+        this._barBottom.className = "hSliderBarBottom_2";
+      }
+      break;
+    }
+  };
+
+  /**
+   * Set the slider by a value. If forceSnap is false, allows values not in the
+   * value set. Assumes the value array is sorted and unique, but no assumptions
+   * are made about order or interval.
+   */
+  Slider.prototype.setByValue = function(val, cancelOnchange) {
+    var valBin, index;
+
+    if (this._values.length > 1) {
+      valBin = this._binValue(val, this._values);
+
+      // If arbitrary values are not allowed, restrict the value to values in
+      // the array
+      if (this._forceSnap && valBin.length > 1) {
+        valBin.length = 1; // Truncate
+        val = this._values[valBin[0]];
+      }
+
+      if (valBin.length > 1) {
+        // Linearly interpolate handle position between nearest value ticks
+        index = valBin[0] + (val - this._values[valBin[0]])/(this._values[valBin[1]] - this._values[valBin[0]]);
+      } else {
+        index = valBin[0];
+      }
+    } else {
+      index = 0;
+      val = this._values[0];
+      valBin = [0];
+    }
+
+    if (val !== this.val) {
+      this._setHandle(index);
+      this.val = val;
+      this._ind = valBin[0];
+
+      if (this._input) {
+        // Set input textbox to new value, truncating the value for display
+        this._input.value = Number(val).toFixed(2).replace(/\.?0+$/,"");
+      }
+
+      if (!cancelOnchange) this.onchange(this.val);
+    }
+  };
+
   /**
    * set a value, priorly check if it is in the value array
    */
-  this.setByValue = function( val, cancelOnchange )
-  {
-    var i = isValue( val );
-    if ( i > -1 )
-    {
-      setByIndex( i, cancelOnchange );
-    }
-    return;
+  Slider.prototype._setByInputHandler = function () {
+    var self = this;
+    return function (e) {
+      var inputVal = Number(this.value);
+      // If not a valid Number, reset slider to previous value (or first value if
+      // previous value is also NaN, such as through bad initialization).
+      if (isNaN(inputVal)) this.value = isNaN(self.val) ? self.values[0] : self.val;
+      else self.setByValue(inputVal);
+    };
   };
-  
-  /**
-   * set a value, priorly check if it is in the value array
-   */
-  var setByInput = function( e )
-  {
-    var i = isValue( this.value );
-    if ( i > -1 )
-    {
-      setByIndex( i );
-    }
-    else
-    {
-      this.value = self.val;
-    }
-    return;
-  };
-  
+
   /**
    * check if a value is in the value array
    *
    * @returns -1 if not, the index of the value otherwise
    */
-  var isValue = function( val )
+  Slider.prototype._isValue = function( val )
   {
-    for ( var i = 0; i < values.length; ++i )
-    {
-      if ( values[ i ] == val )
-        return i;
-    }
-    return -1;
+    var valBin = this._binValue( val, this._values );
+    return valBin.length === 1 ? valBin[0] : -1;
   };
-  
+
+  /**
+   * Find the index of value in a set of sorted bins. If the value is not in the
+   * set, find the bins surrounding the value.
+   */
+  Slider.prototype._binValue = function(val, bins) {
+    var ascending = bins[0] < bins[bins.length - 1];
+    var minVal = ascending ? bins[0] : bins[bins.length - 1];
+    var maxVal = !ascending ? bins[0] : bins[bins.length - 1];
+    val = Number(val);
+
+    // Clamp val to bins range
+    if (val < minVal)
+      return [ascending ? 0 : bins.length - 1];
+    else if (val > maxVal)
+      return [ascending ? bins.length - 1 : 0];
+
+    // Binary search values for bin fitting val
+    var i = 0, j = bins.length - 1, n;
+    while (j - i > 1)  {
+      n = Math.floor((i + j) / 2);
+
+      if (val === bins[n]) {
+        return [n];
+      } else if (val > bins[n]) {
+        if (ascending) i = n;
+        else j = n;
+      } else {
+        if (ascending) j = n;
+        else i = n;
+      }
+    }
+
+    if (val === bins[i]) return [i];
+    if (val === bins[j]) return [j];
+    return [i, j];
+  };
+
   /**
    * mouse button pressed on handle
    */
-  var handleMouseDown = function( e )
+  Slider.prototype._handleMouseDown = function( e )
   {
-    getBarSize();
-    virtualHandlePos = barSize * handlePos / 100;
-    
-    ui.registerEvent( "onmousemove", handleMove );
-    ui.registerEvent( "onmouseup", handleMouseUp );
-    ui.setCursor( "pointer" );
-    ui.catchEvents();
-    ui.onmousedown( e );
-    
+    this._getBarSize();
+    this._virtualHandlePos = this._barSize * this._handlePos / 100;
+
+    CATMAID.ui.registerEvent( "onmousemove", this._boundHandleMove );
+    CATMAID.ui.registerEvent( "onmouseup", this._boundHandleMouseUp );
+    CATMAID.ui.setCursor( "pointer" );
+    CATMAID.ui.catchEvents();
+    CATMAID.ui.onmousedown( e );
+
     return false;
   };
-  
+
   /**
    * mouse button released on handle (on the ui.mouseCatcher respectively)
    */
-  var handleMouseUp = function( e )
+  Slider.prototype._handleMouseUp = function( e )
   {
-    if ( timer ) window.clearTimeout( timer );
-    
-    ui.releaseEvents();
-    ui.removeEvent( "onmousemove", handleMove );
-    ui.removeEvent( "onmouseup", handleMouseUp );
-    
+    if ( this._timer ) window.clearTimeout( this._timer );
+
+    CATMAID.ui.releaseEvents();
+    CATMAID.ui.removeEvent( "onmousemove", this._boundHandleMove );
+    CATMAID.ui.removeEvent( "onmouseup", this._boundHandleMouseUp );
+
     return false;
   };
-  
+
   /**
    * mouse moved on handle (on the mouseCatcher respectively)
    */
-  var handleMove = function( e )
+  Slider.prototype._handleMove = function( e )
   {
     var md;
-    switch ( type )
+    switch ( this._type )
     {
-    case SLIDER_VERTICAL:
-      md = ui.diffY;
+    case Slider.VERTICAL:
+      md = CATMAID.ui.diffY;
       break;
-    case SLIDER_HORIZONTAL:
-      md = ui.diffX;
+    case Slider.HORIZONTAL:
+      md = CATMAID.ui.diffX;
       break;
     }
-    getBarSize();
-    virtualHandlePos = Math.max( 0, Math.min( barSize, virtualHandlePos + md ) );
-    var i = Math.round( virtualHandlePos / barSize * ( values.length - 1 ) );
-    setByIndex( i );
-    
+    this._getBarSize();
+    this._virtualHandlePos = Math.max( 0, Math.min( this._barSize, this._virtualHandlePos + md ) );
+    var i = Math.round( this._virtualHandlePos / this._barSize * ( this._values.length - 1 ) );
+    this._setByIndex( i );
+
     return false;
   };
-  
+
   /**
    * mouse wheel over slider, moves the slider step by step
    */
-  var mouseWheel = function( e )
+  Slider.prototype._mouseWheel = function( e )
   {
-    var w = ui.getMouseWheel( e );
+    var w = CATMAID.ui.getMouseWheel( e );
     if ( w )
     {
-      if ( type == SLIDER_HORIZONTAL ) w *= -1;
-      if ( w > 0 )
-      {
-        setByIndex( Math.min( values.length - 1, ind + 1 ) );
-      }
-      else
-      {
-        setByIndex( Math.max( 0, ind - 1 ) );
-      }
+      if ( this._type == Slider.HORIZONTAL ) w *= -1;
+
+      this.move( w > 0 ? 1 : -1, e.shiftKey );
     }
     return false;
   };
-  
-  /**
-   * decreases the index and invoke timeout
-   */
-  var decrease = function()
-  {
-    setByIndex( Math.max( 0, ind - 1 ) );
-    timer = window.setTimeout( decrease, 250 );
-    return;
+
+  Slider.prototype._clampIndex = function (index, major) {
+    return Math.max(0, Math.min((major ? this._majorValues.length : this._values.length) - 1, index));
   };
-  
-  /**
-   * mouse down on the top bar, so move up, setting a timer
-   */
-  var barTopMouseDown = function( e )
-  {
-    if ( timer ) window.clearTimeout( timer );
-    
-    ui.registerEvent( "onmouseup", barMouseUp );
-    ui.setCursor( "auto" );
-    ui.catchEvents();
-    ui.onmousedown( e );
-    
-    decrease();
-    return false;
-  };
-  
-  /**
-   * increases the index and invoke timeout
-   */
-  var increase = function()
-  {
-    setByIndex( Math.min( values.length - 1, ind + 1 ) );
-    timer = window.setTimeout( increase, 250 );
-    return;
-  };
-  
-  /**
-   * mouse down on the top bar, so move up, setting a timer
-   */
-  var barBottomMouseDown = function( e )
-  {
-    if ( timer ) window.clearTimeout( timer );
-    
-    ui.registerEvent( "onmouseup", barMouseUp );
-    ui.setCursor( "auto" );
-    ui.catchEvents();
-    ui.onmousedown( e );
-    
-    increase();
-    return false;
-  };
-  
+
   /**
    * move the slider from outside
    */
-  this.move = function( i )
+  Slider.prototype.move = function( i, major )
   {
-    setByIndex( Math.max( 0, Math.min( values.length - 1, ind + i ) ) );
+    if ( major )
+    {
+      var valBin = this._binValue( this.val, this._majorValues );
+
+      if ( i < 0 && valBin.length > 1)
+      {
+        valBin[0]++;
+      }
+
+      this._setByIndex( this._isValue( this._majorValues [ this._clampIndex( valBin[0] + i, true ) ] ) );
+    }
+    else
+    {
+      var newIndex = this._clampIndex(this._ind + i);
+      if (Math.abs(this._values[newIndex] - this.val) < this._minMove) {
+        // If the resulting move is below the minMove threshold, try moving twice.
+        newIndex = this._clampIndex(newIndex + i);
+      }
+      this._setByIndex(newIndex);
+    }
   };
-  
+
   /**
-   * mouse up on the top  or bottom bar, so clear the timer
+   * Move the slider and invoke timeout
    */
-  var barMouseUp = function( e )
+  Slider.prototype._moveWithTimeout = function(i, major) {
+    this.move(i, major);
+    this._timer = window.setTimeout(this._moveWithTimeout.bind(this, i, major), 250);
+  };
+
+  /**
+   * mouse down on the bar, so move in the specified direction, setting a timer
+   */
+  Slider.prototype._barMouseDown = function( step, e )
   {
-    if ( timer ) window.clearTimeout( timer );
-    
-    ui.releaseEvents();
-    ui.removeEvent( "onmouseup", barMouseUp );
-    
+    if ( this._timer ) window.clearTimeout( this._timer );
+
+    CATMAID.ui.registerEvent( "onmouseup", this._boundBarMouseUp );
+    CATMAID.ui.setCursor( "auto" );
+    CATMAID.ui.catchEvents();
+    CATMAID.ui.onmousedown( e );
+
+    this._moveWithTimeout(step, e.shiftKey);
     return false;
   };
 
-  var getBarSize = function()
+  /**
+   * mouse up on the top or bottom bar, so clear the timer
+   */
+  Slider.prototype._barMouseUp = function( e )
   {
-    barSize = barSize || parseInt( $( view ).css(
-      type === SLIDER_VERTICAL ? 'height' : 'width') );
+    if ( this._timer ) window.clearTimeout( this._timer );
+
+    CATMAID.ui.releaseEvents();
+    CATMAID.ui.removeEvent( "onmouseup", this._boundBarMouseUp );
+
+    return false;
   };
-  
+
+  Slider.prototype._getBarSize = function()
+  {
+    this._barSize = this._barSize || parseInt( $( this._view ).css(
+        this._type === Slider.VERTICAL ? 'height' : 'width') );
+  };
+
   /**
   * resize the slider
   */
-  this.resize = function( newSize )
+  Slider.prototype.resize = function( newSize )
   {
-    var viewSize;
-    var axis = type === SLIDER_VERTICAL ? 'height' : 'width';
+    var axis = this._type === Slider.VERTICAL ? 'height' : 'width';
     // Clamp the new size to be at least twice as large as the slider handle
-    viewSize = Math.max( parseInt( $( handle ).css( axis ) ) * 2, newSize );
-    barSize = parseInt( $( view ).css( axis ) );
-    view.style[ axis ] = viewSize + "px";
+    var viewSize = Math.max( parseInt( $( this._handle ).css( axis ) ) * 2, newSize );
+    this._barSize = parseInt( $( this._view ).css( axis ) );
+    this._view.style[ axis ] = viewSize + "px";
 
     // update the handle position
-    setByIndex( ind, true );
-    return;
+    this._setByIndex( this._ind, true );
   };
-  
-  this.update = function(
-    min,				//!< the minimal value
-    max,				//!< the maximal value
-    steps,				//!< number of steps or an array of values
-    def,				//!< default value
-    onchange,			//!< method to call
-    split              //!< split value
+
+  Slider.prototype.update = function(
+    min,      //!< the minimal value
+    max,      //!< the maximal value
+    steps,    //!< number of steps, an array of values,
+              //!< or an object literal of either for major and minor steps
+    def,      //!< default value
+    onchange, //!< method to call
+    split     //!< split value
   )
   {
     this.onchange = onchange;
-    if ( ( typeof steps ) == "number" )
+
+    // If steps is not an object, create one.
+    if ( typeof steps !== "object" || Array.isArray( steps ) )
     {
-      values = new Array();
-      if ( steps > 1 )
-        var s = ( max - min ) / ( steps - 1 );
-      else
-        var s = 0;
-      for ( var i = 0; i < steps; ++i )
-        values [ i ] = i * s + min;
+      steps = { major: steps, minor: steps };
     }
-    else if ( ( typeof steps ) == "object" )
-    {
-      values = steps;
-      min = steps[ 0 ];
-      max = steps[ steps.length - 1 ];
-    }
+
+    this._values = [ steps.major, steps.minor ].map( function ( steps ) {
+      var values = [];
+
+      if ( typeof steps === "number" )
+      {
+        var s;
+        if ( steps > 1 )
+          s = ( max - min ) / ( steps - 1 );
+        else
+          s = 0;
+        for ( var i = 0; i < steps; ++i )
+          values[ i ] = i * s + min;
+      }
+      else if ( typeof steps === "object" )
+      {
+        values = steps;
+      }
+
+      return values;
+    } );
+
+    this._majorValues = this._values[ 0 ];
+    // Combine major and minor values, sort, and filter duplicates.
+    this._values = this._majorValues.concat( this._values[ 1 ] ).sort( function ( a, b ) { return a - b; } );
+    if ( this._majorValues[ 0 ] > this._majorValues[ this._majorValues.length - 1 ] ) this._values.reverse();
+    this._values = this._values.filter(function (el, ind, arr) {
+      return ind === 0 || el !== arr[ind - 1];
+    });
 
     // was a split parameter passed?
     if (split === undefined)
     {
       // disable splitting
-      splitIndex = values.length;
+      this._splitIndex = this._values.length;
     }
     else
     {
       // set split index
-      splitIndex = isValue( split );
-      if (splitIndex == -1)
-      {
-          // disable splitting
-          splitIndex = values.length;
-      }
-    }
-    
-    if ( ( typeof def ) != "undefined" )
-    {
-      self.setByValue( def, true );
-    }
-    else
-    {
-      self.setByValue( values[ 0 ], true );
+      this._splitIndex = this._binValue( split, this._values );
+      this._splitIndex = this._splitIndex[ this._splitIndex.length > 1 ? 1 : 0 ];
     }
 
-    if (input)
+    this.setByValue( typeof def !== "undefined" ? def : this._values[ 0 ], true );
+
+    if (this._input)
     {
       // Resize input text box size to accomodate the number of digits in range.
-      input.size = [min, max].map(function (x) {
+      this._input.size = [min, max].map(function (x) {
           return typeof x === "undefined" ? 0 : x.toString().length;
         }).reduce(function (m, x) { return Math.max(m, x); }, 2) + 1;
     }
-    
-    return;
   };
-  
-  // initialise
-  
-  var self = this;
-  if ( type != SLIDER_HORIZONTAL ) type = SLIDER_VERTICAL;
-  var inputView;
-  var timer;
-  
-  var virtualHandlePos = 0; // Handle position when dragging as pixels
-  var handlePos = 0; // Handle position as percentage of slider
-  
-  var values;
-  var ind = 0;  //!< the current index
-  this.val;     //!< the current value
-  var splitIndex = 0; //!< index where to change div class
 
-  if ( !ui ) ui = new UI();
-  
-  var view = document.createElement( "div" );
-  var barTop = document.createElement( "div" );
-  var barBottom = document.createElement( "div" );
-  var handle = document.createElement( "div" );
+  CATMAID.Slider = Slider;
 
-  var barSize;
-  
-  handle.onmousedown = handleMouseDown;
-  barTop.onmousedown = barTopMouseDown;
-  barBottom.onmousedown = barBottomMouseDown;
-  
-  switch ( type )
-  {
-  case SLIDER_VERTICAL:
-    view.className = "vSliderView";
-    barTop.className = "vSliderBarTop";
-    barBottom.className = "vSliderBarBottom";
-    handle.className = "vSliderHandle";
-    break;
-  case SLIDER_HORIZONTAL:
-    view.className = "hSliderView";
-    barTop.className = "hSliderBarTop";
-    barBottom.className = "hSliderBarBottom";
-    handle.className = "hSliderHandle";
-    break;
-  }
-  
-  view.appendChild( barTop );
-  view.appendChild( handle );
-  view.appendChild( barBottom );
-  
-  if ( input )
-  {
-    var name = uniqueId();
-    
-    inputView = document.createElement( "p" );
-    inputView.style.paddingLeft = "0.5em";
-    input = document.createElement( "input" );
-    input.type = "text";
-    input.size = "3";
-    input.id = input.name = name;
-    
-    var map = document.createElement( "map" );
-    map.id = map.name = "map_" + name;
-    var area1 = document.createElement( "area" );
-    area1.shape = "rect";
-    area1.coords = "0,0,13,9";
-    area1.alt = "+";
-    var area2 = document.createElement( "area" );
-    area2.shape = "rect";
-    area2.coords = "0,10,13,18";
-    area2.alt = "-";
-    
-    switch ( type )
-    {
-    case SLIDER_HORIZONTAL:
-      area1.onmousedown = barBottomMouseDown;
-      area2.onmousedown = barTopMouseDown;
-      break;
-    case SLIDER_VERTICAL:
-      area1.onmousedown = barTopMouseDown;
-      area2.onmousedown = barBottomMouseDown;
-      break;
-    }
-    area1.onmouseup = barMouseUp;
-    area2.onmouseup = barMouseUp;
-    
-    map.appendChild( area1 );
-    map.appendChild( area2 );
-    
-    var img = document.createElement( "img" );
-    img.src = STATIC_URL_JS + "images/input_topdown.svg";
-    img.setAttribute('onerror', 'this.onerror=null;this.src="' +
-      STATIC_URL_JS + 'images/input_topdown.gif";');
-    img.alt = "";
-    img.useMap = "#map_" + name;
-    
-    inputView.appendChild( map );
-    inputView.appendChild( input );
-    inputView.appendChild( img );
-    
-    inputView.style.display = "none";
-    inputView.style.display = "block";
-    
-    input.onchange = setByInput;
-    try
-    {
-      input.addEventListener( "DOMMouseScroll", mouseWheel, false );
-      /* Webkit takes the event but does not understand it ... */
-      input.addEventListener( "mousewheel", mouseWheel, false );
-    }
-    catch ( error )
-    {
-      try
-      {
-        input.onmousewheel = mouseWheel;
-      }
-      catch ( error ) {}
-    }
-  }
-  
-  try
-  {
-    view.addEventListener( "DOMMouseScroll", mouseWheel, false );
-    /* Webkit takes the event but does not understand it ... */
-    view.addEventListener( "mousewheel", mouseWheel, false );
-  }
-  catch ( error )
-  {
-    try
-    {
-      view.onmousewheel = mouseWheel;
-    }
-    catch ( error ) {}
-  }
-  
-  this.update( min, max, steps, def, onchange, split);
-};
+})(CATMAID);

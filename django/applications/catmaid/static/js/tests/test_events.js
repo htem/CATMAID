@@ -1,5 +1,5 @@
 QUnit.test('Event system test', function( assert ) {
-  var e = Events.Event;
+  var e = CATMAID.Events.Event;
 
   /**
    * Test if something is a function. From:
@@ -8,7 +8,7 @@ QUnit.test('Event system test', function( assert ) {
   function isFunction(functionToCheck) {
      var getType = {};
      return functionToCheck && getType.toString.call(functionToCheck) === '[object Function]';
-  };
+  }
 
   // Make sure the event object has an on and a trigger function
   assert.ok(isFunction(e.on), 'has on function');
@@ -18,7 +18,7 @@ QUnit.test('Event system test', function( assert ) {
   var wasCalled = false;
   function callback() {
     wasCalled = true;
-  };
+  }
   e.on('foo', callback);
   e.trigger('foo');
   assert.ok(wasCalled, 'executes callback when even is triggered');
@@ -31,7 +31,7 @@ QUnit.test('Event system test', function( assert ) {
       receivedArguments.push(arguments[i]);
     }
 
-  };
+  }
   e.on('foo2', callback2);
   e.trigger('foo2', 1, 2);
   assert.deepEqual(receivedArguments, [1, 2], 'executes callback with ' +
@@ -54,7 +54,7 @@ QUnit.test('Event system test', function( assert ) {
   var wasExecuted = false;
   e.on('foo5', function() {
     wasExecuted = true;
-  })
+  });
   assert.strictEqual(e.clear('foo5'), true, 'removal of listeners for an ' +
       'existing event was successful');
   e.trigger('foo5');
@@ -66,7 +66,7 @@ QUnit.test('Event system test', function( assert ) {
   var wasExecuted3 = false;
   function callback3() {
     wasExecuted2 = true;
-  };
+  }
   e.on('foo6', callback3);
   e.on('foo6', function() {
     wasExecuted3 = true;
@@ -79,12 +79,43 @@ QUnit.test('Event system test', function( assert ) {
 
   // Test extension of object with event system
   var obj2 = {};
-  Events.extend(obj2);
-  assert.strictEqual(obj2.on, Events.Event.on);
-  assert.strictEqual(obj2.trigger, Events.Event.trigger);
+  CATMAID.Events.extend(obj2);
+  assert.strictEqual(obj2.on, CATMAID.Events.Event.on);
+  assert.strictEqual(obj2.trigger, CATMAID.Events.Event.trigger);
 
   // Test if extension of an object returns the object
   var obj3 = {};
-  assert.strictEqual(Events.extend(obj3), obj3);
+  assert.strictEqual(CATMAID.Events.extend(obj3), obj3);
+
+  // Test if context is ignored  on removal, if not passed
+  (function() {
+    var e = CATMAID.Events.Event;
+    var wasExecuted = false;
+    var handler = function() { wasExecuted = true; };
+    var o1 = {}, o2 = {};
+    e.on('foo', handler, o1);
+    e.on('foo', handler, o2);
+    e.off('foo', handler);
+    e.trigger('foo');
+    assert.strictEqual(wasExecuted, false, 'remove all listeners for callback, ' +
+        'if context is not passed');
+  })();
+
+  // Test if context is respected on removal, if passed
+  (function() {
+    var e = CATMAID.Events.Event;
+    var wasExecuted = false;
+    var executionContext;
+    var handler = function() { wasExecuted = true; executionContext = this; };
+    var o1 = {}, o2 = {};
+    e.on('foo', handler, o1);
+    e.on('foo', handler, o2);
+    e.off('foo', handler, o1);
+    e.trigger('foo');
+    assert.strictEqual(wasExecuted, true, 'remove only listeners for a given ' +
+        'if a context is passed for removal 1');
+    assert.strictEqual(executionContext, o2, 'remove only listeners for a given ' +
+        'if a context is passed for removal 2');
+  })();
 });
 

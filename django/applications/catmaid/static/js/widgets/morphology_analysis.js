@@ -1,5 +1,13 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  Arbor,
+  fetchSkeletons,
+  InstanceRegistry,
+  NeuronNameService,
+  project,
+  SkeletonAnnotations,
+*/
 
 "use strict";
 
@@ -13,7 +21,7 @@ var MorphologyPlot = function() {
 
 MorphologyPlot.prototype = {};
 $.extend(MorphologyPlot.prototype, new InstanceRegistry());
-$.extend(MorphologyPlot.prototype, new SkeletonSource());
+$.extend(MorphologyPlot.prototype, new CATMAID.SkeletonSource());
 
 MorphologyPlot.prototype.getName = function() {
   return "Morphology Plot " + this.widgetID;
@@ -118,7 +126,7 @@ MorphologyPlot.prototype.append = function(models) {
       (function(skeleton_id) {
         // Failed loading
         var model = this.models[skeleton_id];
-        growlAlert("ERROR", "Failed to fetch " + model.baseName + ' #' + skeleton_id);
+        CATMAID.msg("ERROR", "Failed to fetch " + model.baseName + ' #' + skeleton_id);
       }).bind(this),
       (function() {
         // Done loading all
@@ -163,7 +171,7 @@ MorphologyPlot.prototype._populateLine = function(skeleton_id) {
   });
   var center = this._computeCenter(this.center_mode, arbor, positions, line.connectors);
   if (center.error) {
-    growlAlert('WARNING', center.error + " for " + NeuronNameService.getInstance().getName(skeleton_id));
+    CATMAID.warn(center.error + " for " + NeuronNameService.getInstance().getName(skeleton_id));
     center = this._computeCenter(center.alternative_mode, arbor, positions, line.connectors);
   }
 
@@ -473,7 +481,8 @@ MorphologyPlot.prototype.exportCSV = function() {
 };
 
 MorphologyPlot.prototype.exportSVG = function() {
-  saveDivSVG('morphology_plot_div' + this.widgetID, this.mode.replace(/ /g, '_') + ".svg");
+  CATMAID.svgutil.saveDivSVG('morphology_plot_div' + this.widgetID,
+      this.mode.replace(/ /g, '_') + ".svg");
 };
 
 /** Perform PCA on a vector for each neuron containing the concatenation of all the following measurements:

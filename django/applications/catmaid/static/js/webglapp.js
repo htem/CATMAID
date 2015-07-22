@@ -1,5 +1,24 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  CATMAID,
+  Arbor,
+  error,
+  fetchSkeletons,
+  InstanceRegistry,
+  NeuronNameService,
+  project,
+  Project,
+  requestQueue,
+  SelectionTable,
+  session,
+  SkeletonAnnotations,
+  SkeletonRegistry,
+  submitterFn,
+  SynapseClustering,
+  User,
+  WindowMaker
+ */
 
 "use strict";
 
@@ -11,6 +30,10 @@ var WebGLApplication = function() {
   this.registerSource();
   // Indicates whether init has been called
   this.initialized = false;
+  // Indicates if there is an animation running
+  this.animationRequestId = undefined;
+  // The current animation, if any
+  this.animation = undefined;
 
   // Listen to changes of the active node
   SkeletonAnnotations.on(SkeletonAnnotations.EVENT_ACTIVE_NODE_CHANGED,
@@ -19,7 +42,7 @@ var WebGLApplication = function() {
 
 WebGLApplication.prototype = {};
 $.extend(WebGLApplication.prototype, new InstanceRegistry());
-$.extend(WebGLApplication.prototype, new SkeletonSource());
+$.extend(WebGLApplication.prototype, new CATMAID.SkeletonSource());
 
 WebGLApplication.prototype.init = function(canvasWidth, canvasHeight, divID) {
 	if (this.initialized) {
@@ -27,13 +50,18 @@ WebGLApplication.prototype.init = function(canvasWidth, canvasHeight, divID) {
 	}
 	this.divID = divID;
 	this.container = document.getElementById(divID);
-	this.stack = project.focusedStack;
+  this.stack = project.focusedStackViewer.primaryStack;
   this.submit = new submitterFn();
 	this.options = new WebGLApplication.prototype.OPTIONS.clone();
-	this.space = new this.Space(canvasWidth, canvasHeight, this.container, this.stack);
+	this.space = new this.Space(canvasWidth, canvasHeight, this.container, this.stack, this.options);
   this.updateActiveNodePosition();
+  project.on(Project.EVENT_STACKVIEW_FOCUS_CHANGED, this.adjustStaticContent, this);
+  project.on(Project.EVENT_LOCATION_CHANGED, this.handlelLocationChange, this);
 	this.initialized = true;
 };
+
+// Store views in the prototype to make them available for all intances.
+WebGLApplication.prototype.availableViews = {};
 
 WebGLApplication.prototype.getName = function() {
   return "3D View " + this.widgetID;
@@ -41,10 +69,13 @@ WebGLApplication.prototype.getName = function() {
 
 WebGLApplication.prototype.destroy = function() {
   SkeletonAnnotations.off(SkeletonAnnotations.EVENT_ACTIVE_NODE_CHANGED,
-      this.staticUpdateActiveNodePosition);
+      this.staticUpdateActiveNodePosition, this);
+  project.off(Project.EVENT_STACKVIEW_FOCUS_CHANGED, this.adjustStaticContent, this);
+  project.off(Project.EVENT_LOCATION_CHANGED, this.handlelLocationChange, this);
   this.unregisterInstance();
   this.unregisterSource();
   this.space.destroy();
+  NeuronNameService.getInstance().unregister(this);
   Object.keys(this).forEach(function(key) { delete this[key]; }, this);
 };
 
@@ -112,7 +143,7 @@ WebGLApplication.prototype.resizeView = function(w, h) {
     $('#viewer-3d-webgl-canvas' + this.widgetID).height(canvasHeight);
     $('#viewer-3d-webgl-canvas' + this.widgetID).css("background-color", "#000000");
 
-    this.space.setSize(canvasWidth, canvasHeight);
+    this.space.setSize(canvasWidth, canvasHeight, this.options);
 
     this.space.render();
   }
@@ -120,8 +151,6 @@ WebGLApplication.prototype.resizeView = function(w, h) {
 
 WebGLApplication.prototype.fullscreenWebGL = function() {
 	if (THREEx.FullScreen.activated()){
-		var w = canvasWidth, h = canvasHeight;
-		this.resizeView( w, h );
 		THREEx.FullScreen.cancel();
 	} else {
 		THREEx.FullScreen.request(document.getElementById('viewer-3d-webgl-canvas' + this.widgetID));
@@ -130,6 +159,464 @@ WebGLApplication.prototype.fullscreenWebGL = function() {
 	}
 	this.space.render();
 };
+
+
+/**
+ * Show a dialog to ask the user for image dimensions, resize the view to the
+ * new dimensions,execute the given function and return to the original
+ * dimension afterwards.
+ */
+WebGLApplication.prototype.askForDimensions = function(title, fn) {
+  var dialog = new CATMAID.OptionsDialog(title);
+  dialog.appendMessage("Please adjust the dimensions to your liking. They " +
+      "default to the current size of the 3D viewer");
+  var imageWidthField = dialog.appendField("Image width (px): ",
+      "image-width", this.space.canvasWidth);
+  var imageHeightField = dialog.appendField("Image height (px): ",
+      "image-height", this.space.canvasHeight);
+
+  dialog.onOK = handleOK.bind(this);
+  dialog.show(350, "auto", true);
+
+  function handleOK() {
+    /* jshint validthis: true */ // `this` is bound to this WebGLApplication
+    $.blockUI();
+
+    var originalWidth, originalHeight;
+    try {
+      var width = parseInt(imageWidthField.value);
+      var height = parseInt(imageHeightField.value);
+
+      if (!width || !height) {
+        throw new CATMAID.ValueError("Please use valid width and height values");
+      }
+
+      // Save current dimensions and set new ones, if available
+      if (width !== this.space.canvasWidth || height !== this.space.canvasHeight) {
+        originalWidth = this.space.canvasWidth;
+        originalHeight = this.space.canvasHeight;
+        this.resizeView(width, height);
+      } else {
+        this.space.render();
+      }
+
+      // Call passed in function
+      if (CATMAID.tools.isFn(fn)) fn();
+    } catch (e) {
+      CATMAID.error("An error occurred", e);
+    }
+
+    // Restore original dimensions
+    if (originalWidth && originalHeight) {
+      this.resizeView(originalWidth, originalHeight);
+    }
+
+    $.unblockUI();
+  }
+};
+
+
+/**
+ * Store the current view as PNG image.
+ */
+WebGLApplication.prototype.exportPNG = function() {
+  this.askForDimensions("PNG export", (function() {
+    try {
+      /* jshint validthis: true */ // `this` is bound to this WebGLApplication
+      var imageData = this.space.view.getImageData();
+      var blob = CATMAID.tools.dataURItoBlob(imageData);
+      CATMAID.info("The exported PNG will have a transparent background");
+      saveAs(blob, "catmaid_3d_view.png");
+    } catch(e) {
+      CATMAID.error("Could not export current 3D view, there was an error.", e);
+    }
+  }).bind(this));
+};
+
+/**
+ * Store the current view as SVG image.
+ */
+WebGLApplication.prototype.exportSVG = function() {
+  this.askForDimensions("SVG export", (function() {
+    try {
+      /* jshint validthis: true */ // `this` is bound to this WebGLApplication
+      var svg = this.space.view.getSVGData();
+      CATMAID.svgutil.reduceCoordinatePrecision(svg, 1);
+      CATMAID.svgutil.stripStyleProperties(svg, {
+        'fill': 'none',
+        'stroke-opacity': 1,
+        'stroke-linejoin': undefined
+      });
+      CATMAID.svgutil.reduceStylePrecision(svg, 1);
+
+      var styleDict = CATMAID.svgutil.classifyStyles(svg);
+
+      var styles = Object.keys(styleDict).reduce(function(o, s) {
+        var cls = styleDict[s];
+        o = o + "." + cls + "{" + s + "}";
+        return o;
+      }, "");
+
+      var xml = $.parseXML(new XMLSerializer().serializeToString(svg));
+      CATMAID.svgutil.addStyles(xml, styles);
+
+      var data = new XMLSerializer().serializeToString(xml);
+      var blob = new Blob([data], {type: 'text/svg'});
+      saveAs(blob, "catmaid-3d-view.svg");
+    } catch (e) {
+      CATMAID.error("Could not export current 3D view, there was an error.", e);
+    }
+  }).bind(this));
+};
+
+/**
+ * Create an store a neuron catalog SVG for the current view.
+ */
+WebGLApplication.prototype.exportCatalogSVG = function() {
+  var dialog = new CATMAID.OptionsDialog("Catalog export options");
+  dialog.appendMessage('Adjust the catalog export settings to your liking.');
+
+  // Create a new empty neuron name service that takes care of the sorting names
+  var ns = NeuronNameService.newInstance(true);
+  var namingOptions = ns.getOptions();
+  var namingOptionNames = namingOptions.map(function(o) { return o.name; });
+  var namingOptionIds = namingOptions.map(function(o) { return o.id; });
+
+  // Get available skeleton list sources
+	var pinSourceOptions = CATMAID.skeletonListSources.createOptions();
+  var pinSourceOptionNames = ["(None)"].concat(pinSourceOptions.map(function(o) { return o.text; }));
+  var pinSourceOptionIds = ['null'].concat(pinSourceOptions.map(function(o) { return o.value; }));
+
+  // Add options to dialog
+  var columns = dialog.appendField("# Columns: ", "svg-catalog-num-columns", '2');
+  var sorting = dialog.appendChoice("Sorting name: ", "svg-catalog-sorting",
+      namingOptionNames, namingOptionIds);
+  var pinSources = dialog.appendChoice("Skeletons to pin: ", "svg-catalog-pin-source",
+      pinSourceOptionNames, pinSourceOptionIds);
+  var displayNames = dialog.appendCheckbox('Display names', 'svg-catalog-display-names', true);
+  var coordDigits = dialog.appendField("# Coordinate decimals", 'svg-catalog-coord-digits', '1');
+  var fontsize = dialog.appendField("Fontsize: ", "svg-catalog-fontsize", '14');
+  var margin = dialog.appendField("Margin: ", "svg-catalog-margin", '10');
+  var padding = dialog.appendField("Padding: ", "svg-catalog-pading", '10');
+  var title = dialog.appendField("Title: ", "svg-catalog-title", 'CATMAID neuron catalog');
+
+  // Use change chandler of labeling select to ask user for annotations
+  var labelingOption;
+  $(sorting).on('change', function() {
+    var newLabel = namingOptionIds[sorting.selectedIndex];
+    if (newLabel === 'all-meta' || newLabel === 'own-meta') {
+      // Ask for meta annotation
+      var dialog = new CATMAID.OptionsDialog("Please enter meta annotation");
+      var field = dialog.appendField("Meta annotation", 'meta-annotation',
+          '', true);
+      dialog.onOK = function() {
+        labelingOption = field.value;
+      };
+
+      // Update all annotations before, showing the dialog
+      CATMAID.annotations.update(function() {
+        dialog.show();
+        // Add auto complete to input field
+        $(field).autocomplete({
+          source: CATMAID.annotations.getAllNames()
+        });
+      });
+    } else {
+      labelingOption = undefined;
+    }
+  });
+
+  dialog.onOK = handleOK.bind(this);
+
+  dialog.show(400, 460, true);
+
+  function handleOK() {
+    /* jshint validthis: true */ // `this` is bound to this WebGLApplication
+    $.blockUI();
+    // Get models of exported skeletons
+    var models = this.getSelectedSkeletonModels();
+    // Configure labeling of name service
+    var labelingId = namingOptionIds[sorting.selectedIndex];
+    ns.addLabeling(labelingId, labelingOption);
+
+    // Check if there are pinned skeletons that have to be loaded first
+    var pinnedSkeletonModels = {};
+    if (pinSources.selectedIndex > 0) {
+      var srcId = pinSourceOptionIds[pinSources.selectedIndex];
+      var src = CATMAID.skeletonListSources.getSource(srcId);
+      pinnedSkeletonModels = src.getSelectedSkeletonModels();
+    }
+    var pinnedSkeletonIds = Object.keys(pinnedSkeletonModels);
+    var addedPinnendSkeletons = pinnedSkeletonIds.filter(function(skid) {
+      return !(skid in models);
+    });
+
+    // Fetch names for the sorting
+    ns.registerAll(dialog, models, (function() {
+      if (0 === addedPinnendSkeletons.length) {
+        createSVG.call(this);
+      } else {
+        // Make sure all pinned skeletons are available in the 3D viewer
+        this.addSkeletons(pinnedSkeletonModels, (function() {
+          this.space.render();
+          createSVG.call(this);
+          // Remove all added pinned skeletons again
+          this.removeSkeletons(addedPinnendSkeletons);
+        }).bind(this));
+      }
+    }).bind(this));
+
+    function createSVG() {
+      try {
+        // Build sorting name list
+        var skeletonIds = Object.keys(models);
+        var sortingNames = skeletonIds.reduce(function(o, skid) {
+          var name = ns.getName(skid);
+          if (!name) {
+            throw "No valid name found for skeleton " + skid +
+                " with labeling " + labelingId +
+                labelingOption ? "(" + labelingOption + ")" : "";
+          }
+          o[skid] = name;
+          return o;
+        }, {});
+        // Sort skeleton IDs based on the names
+        skeletonIds.sort(function(a, b) {
+          return sortingNames[a].localeCompare(sortingNames[b], 'en',
+              {numeric: true});
+        });
+
+        // Collect options
+        var options = {
+          layout: 'catalog',
+          columns: parseInt(columns.value),
+          skeletons: skeletonIds,
+          pinnedSkeletons: pinnedSkeletonIds,
+          displaynames: Boolean(displayNames.checked),
+          fontsize: parseFloat(fontsize.value),
+          margin: parseInt(margin.value),
+          padding: parseInt(padding.value),
+          title: title.value,
+        };
+
+        // Export catalog
+        var svg = this.space.view.getSVGData(options);
+        var precision = parseInt(coordDigits.value);
+        CATMAID.svgutil.reduceCoordinatePrecision(svg, precision);
+        CATMAID.svgutil.stripStyleProperties(svg, {
+          'fill': 'none',
+          'stroke-opacity': 1,
+          'stroke-linejoin': undefined
+        });
+        CATMAID.svgutil.reduceStylePrecision(svg, precision);
+
+        var styleDict = CATMAID.svgutil.classifyStyles(svg);
+
+        var styles = Object.keys(styleDict).reduce(function(o, s) {
+          var cls = styleDict[s];
+          o = o + "." + cls + "{" + s + "}";
+          return o;
+        }, "");
+
+        var xml = $.parseXML(new XMLSerializer().serializeToString(svg));
+        CATMAID.svgutil.addStyles(xml, styles);
+
+        var data = new XMLSerializer().serializeToString(xml);
+        var blob = new Blob([data], {type: 'text/svg'});
+        saveAs(blob, "catmaid-neuron-catalog.svg");
+      } catch (e) {
+        CATMAID.error("Could not export neuron catalog. There was an error.", e);
+      }
+      $.unblockUI();
+    }
+  }
+};
+
+WebGLApplication.prototype.exportSkeletonsAsCSV = function() {
+  var sks = this.space.content.skeletons,
+      yD = this.space.yDimension,
+      rows = ["skeleton_id, treenode_id, parent_treenode_id, x, y, z"];
+  Object.keys(sks).forEach(function(skid) {
+    var vs = sks[skid].getPositions(),
+        arbor = sks[skid].createArbor(),
+        edges = arbor.edges;
+    edges[arbor.root] = '';
+    Object.keys(vs).forEach(function(tnid) {
+      var v = vs[tnid];
+      // Transform back to Stack coords
+      rows.push(skid + "," + tnid + "," + edges[tnid]  + "," + v.x + "," + (yD - v.y) + "," + (-v.z));
+    });
+  });
+  saveAs(new Blob([rows.join('\n')], {type : 'text/csv'}), "skeleton_coordinates.csv");
+};
+
+/** Return a list of skeleton IDs that have nodes within radius of the active node. */
+WebGLApplication.prototype.spatialSelect = function() {
+  if (!this.options.show_active_node) return alert("Enable active node!");
+  var active_skid = SkeletonAnnotations.getActiveSkeletonId(),
+      skeletons = this.space.content.skeletons;
+  if (!active_skid) return alert("No active skeleton!");
+  if (!skeletons[active_skid]) return alert("Active skeleton is not present in the 3D view!");
+  var od = new CATMAID.OptionsDialog("Spatial select"),
+      choice = od.appendChoice("Select neurons ", "spatial-mode",
+          ["in nearby space",
+           "synapting with active neuron",
+           "synapting and downstream of active node",
+           "synapting and upstream of active node"],
+           [0, 1, 2, 3], 1),
+      field = od.appendField("... within distance from the active node (nm):", "spatial-distance", this.options.distance_to_active_node),
+      choice2 = od.appendChoice("If synapting, pick ", "spatial-synapse-type",
+          ["both",
+           "downstream partner",
+           "upstream partner"],
+          [-1, 0, 1], -1),
+      choice3 = od.appendChoice("... of which load: ", "spatial-filter",
+          ["skeletons with more than 1 node",
+           "skeletons with 1 single node",
+           "all"],
+          [0, 1, 2], 0),
+      checkbox = od.appendCheckbox("Only among loaded in 3D view", "spatial-loaded", false);
+
+  od.onOK = (function() {
+    var distance = this._validate(field.value, "Invalid distance value");
+    if (!distance) return;
+    var mode = Number(choice.value),
+        distanceSq = distance * distance,
+        synapse_mode = Number(choice2.value),
+        skeleton_mode = Number(choice3.value),
+        loaded_only = checkbox.checked,
+        active_node = SkeletonAnnotations.getActiveNodeId(),
+        p = SkeletonAnnotations.getActiveNodePositionW(),
+        va = new THREE.Vector3(p.x, p.y, p.z),
+        synapticTypes = WebGLApplication.prototype.Space.prototype.Skeleton.prototype.synapticTypes,
+        near = null,
+        query = null,
+        post = null,
+        filter = function(sk) {
+          if (2 == skeleton_mode) return true;
+          else if (0 === skeleton_mode) return sk.geometry['neurite'].vertices.length > 1;
+          else if (1 == skeleton_mode) return 1 === sk.geometry['neurite'].vertices.length;
+        };
+    // Restrict by synaptic relation
+    switch (synapse_mode) {
+      case 0: synapticTypes = synapticTypes.slice(0, 1); break;
+      case 1: synapticTypes = synapticTypes.slice(1, 2); break;
+    }
+
+    var newSelection = function(skids) {
+      if (0 === skids.length) return CATMAID.info("No skeletons found");
+      var models = {};
+      skids.forEach(function(skid) {
+        models[skid] = new SelectionTable.prototype.SkeletonModel(skid, "", new THREE.Color().setRGB(0.5, 0.5, 0.5));
+      });
+      WindowMaker.create('neuron-staging-area');
+      var sel = SelectionTable.prototype.getLastInstance();
+      sel.append(models);
+    };
+
+    // Restrict by spatial position
+    if (0 === mode) {
+      // Intersect 3D viewer's skeletons
+      if (loaded_only) {
+        near = [];
+        Object.keys(skeletons).forEach(function(skid) {
+          if (active_skid == skid) return; // == to enable string vs int comparison
+          var s = skeletons[skid];
+          if (s.visible && filter(s) && s.geometry['neurite'].vertices.some(function(v) {
+            return va.distanceToSquared(v) < distanceSq;
+          })) {
+            near.push(skid);
+          }
+        });
+      } else {
+        query = "within-spatial-distance";
+        post = {distance: distance,
+                treenode: active_node,
+                size_mode: skeleton_mode};
+      }
+    } else {
+      var sk = skeletons[active_skid],
+          arbor = sk.createArbor();
+      // Restrict part of the arbor to look at
+      switch(mode) {
+        case 2: // Only downstream
+          arbor = arbor.subArbor(active_node);
+          break;
+        case 3: // Only upstream
+          arbor.subArbor(active_node).nodesArray().forEach(function(node) {
+            if (node === active_node) return;
+            delete arbor.edges[node];
+          });
+      }
+      var within = arbor.findNodesWithin(active_node,
+          (function(child, paren) {
+            return this[child].distanceTo(this[paren]);
+          }).bind(sk.getPositions()),
+          distance);
+      // Find connectors within the part to look at
+      var connectors = {};
+      synapticTypes.forEach(function(type) {
+        var vs = sk.geometry[type].vertices;
+        for (var i=0; i<vs.length; i+=2) {
+          if (within[vs[i+1].node_id]) connectors[vs[i].node_id] = true;
+        }
+      });
+      // Find partner skeletons
+      if (loaded_only) {
+        near = [];
+        // Find the same connectors in other loaded skeletons
+        Object.keys(skeletons).forEach(function(skid) {
+          if (skid === active_skid) return;
+          var partner = skeletons[skid];
+          if (!filter(partner)) return;
+          synapticTypes.forEach(function(type) {
+            var vs = partner.geometry[type].vertices;
+            for (var i=0; i<vs.length; i+=2) {
+              var connector_id = vs[i].node_id;
+              if (connectors[connector_id]) {
+                near.push(skid);
+                break;
+              }
+            }
+          });
+        });
+      } else {
+        var cs = Object.keys(connectors).map(Number);
+        if (cs.length > 0) {
+          query = "partners-by-connector";
+          post = {connectors: cs,
+                  skid: active_skid,
+                  relation: synapse_mode,
+                  size_mode: skeleton_mode};
+        } else {
+          newSelection([]);
+        }
+      }
+    }
+    // List selected skeletons if any
+    if (near) {
+      newSelection(near);
+    } else if (query) {
+      requestQueue.register(django_url + project.id + '/skeletons/' + query, "POST", post,
+        function(status, text) {
+          if (200 !== status) return;
+          var json = $.parseJSON(text);
+          if (json.error) return new CATMAID.ErrorDialog(
+              "Could not fetch skeletons.", json.error);
+          if (json.skeletons) {
+            if (json.reached_limit) CATMAID.warn("Too many: loaded only a subset");
+            newSelection(json.skeletons);
+          } else {
+            newSelection(json);
+          }
+        });
+    }
+  }).bind(this);
+
+  od.show(300, 300, false);
+};
+
+
 
 WebGLApplication.prototype.Options = function() {
 	this.show_meshes = false;
@@ -147,6 +634,7 @@ WebGLApplication.prototype.Options = function() {
   this.color_method = 'none';
   this.tag_regex = '';
   this.connector_color = 'cyan-red';
+  this.camera_view = 'perspective';
   this.lean_mode = false;
   this.synapse_clustering_bandwidth = 5000;
   this.smooth_skeletons = false;
@@ -154,7 +642,16 @@ WebGLApplication.prototype.Options = function() {
   this.resample_skeletons = false;
   this.resampling_delta = 3000; // nm
   this.skeleton_line_width = 3;
+  this.skeleton_node_scaling = 1.0;
   this.invert_shading = false;
+  this.follow_active = false;
+  this.distance_to_active_node = 5000; // nm
+  this.min_synapse_free_cable = 5000; // nm
+  this.animation_rotation_axis = "up";
+  this.animation_rotation_speed = 0.01;
+  this.animation_back_forth = false;
+  this.animation_stepwise_visibility = false;
+  this.strahler_cut = 2; // to approximate twigs
 };
 
 WebGLApplication.prototype.Options.prototype = {};
@@ -177,21 +674,10 @@ WebGLApplication.prototype.Options.prototype.createMeshMaterial = function(color
 /** Persistent options, get replaced every time the 'ok' button is pushed in the dialog. */
 WebGLApplication.prototype.OPTIONS = new WebGLApplication.prototype.Options();
 
-WebGLApplication.prototype.updateZPlane = function() {
-	this.space.staticContent.updateZPlanePosition(this.stack);
-	this.space.render();
-};
-
-WebGLApplication.prototype.staticUpdateZPlane = function() {
-  this.getInstances().forEach(function(instance) {
-    instance.updateZPlane();
-  });
-};
-
 /** Receives an extra argument (an event) which is ignored. */
 WebGLApplication.prototype.updateColorMethod = function(colorMenu) {
   if ('downstream-of-tag' === colorMenu.value) {
-    var dialog = new OptionsDialog("Type in tag");
+    var dialog = new CATMAID.OptionsDialog("Type in tag");
     dialog.appendMessage("Nodes downstream of tag: magenta.\nNodes upstream of tag: dark grey.");
     var input = dialog.appendField("Tag (regex): ", "tag_text", this.options.tag_regex);
     dialog.onOK = (function() {
@@ -244,7 +730,8 @@ WebGLApplication.prototype.updateSkeletonColors = function(callback) {
           console.log('ERROR: failed to load reviews for skeleton ' + skeleton_id);
         },
         fnRecolor);
-  } else if ('axon-and-dendrite' === this.options.color_method) {
+  } else if ('axon-and-dendrite' === this.options.color_method
+          || 'dendritic-backbone' === this.options.shading_method) {
     var skeletons = this.space.content.skeletons;
     // Find the subset of skeletons that don't have their axon loaded
     var skeleton_ids = Object.keys(skeletons).filter(function(skid) {
@@ -261,7 +748,7 @@ WebGLApplication.prototype.updateSkeletonColors = function(callback) {
         },
         function(skid) {
           // Failed loading
-          skeletons[skid].axon = {}; // dummy
+          skeletons[skid].axon = null;
           console.log('ERROR: failed to load axon-and-dendrite for skeleton ' + skid);
         },
         fnRecolor);
@@ -290,6 +777,64 @@ WebGLApplication.prototype.ZXView = function() {
 	this.space.render();
 };
 
+/**
+ * Store the curren view with the given name.
+ */
+WebGLApplication.prototype.storeCurrentView = function(name, callback) {
+  if (!name) {
+    var dialog = new CATMAID.OptionsDialog("Store current view");
+    dialog.appendMessage('Please enter a name for the current view');
+    var n = this.getStoredViews().length + 1;
+    var nameField = dialog.appendField("Name: ", "new-view-name", 'View ' + n);
+
+    // Call this function with a name as parameter
+    dialog.onOK = (function() {
+      this.storeCurrentView(nameField.value, callback);
+    }).bind(this);
+    dialog.show(300, 200, true);
+  } else {
+    // Abort if a view with this name exists already
+    if (name in this.availableViews) {
+      CATMAID.error("A view with the name \"" + name + "\" already exists.");
+      return;
+    }
+    // Store view
+    this.availableViews[name] = this.space.view.getView();
+
+    if (callback) {
+      callback();
+    }
+  }
+};
+
+/**
+ * Return the list of stored views.
+ */
+WebGLApplication.prototype.getStoredViews = function() {
+  return Object.keys(this.availableViews);
+};
+
+/**
+ * Set the view to a previously stored one and return true. Returns false if
+ * no views was found under the given name.
+ *
+ * @param {String} name - name of the view to activate
+ */
+WebGLApplication.prototype.activateView = function(name) {
+  if (!(name in this.availableViews)) {
+    CATMAID.error("There is no view named \"" + name + "\"!");
+    return;
+  }
+  // Activate view by executing the stored function
+  var view = this.availableViews[name];
+  this.space.view.setView(view.target, view.position, view.up, view.zoom,
+      view.orthographic);
+  // Update options
+  this.options.camera_view = view.orthographic ? 'orthographic' : 'perspective';
+  // Render scene
+  this.space.render();
+};
+
 WebGLApplication.prototype._skeletonVizFn = function(field) {
 	return function(skeleton_id, value) {
 		var skeletons = this.space.content.skeletons;
@@ -303,73 +848,235 @@ WebGLApplication.prototype.setSkeletonPreVisibility = WebGLApplication.prototype
 WebGLApplication.prototype.setSkeletonPostVisibility = WebGLApplication.prototype._skeletonVizFn('Post');
 WebGLApplication.prototype.setSkeletonTextVisibility = WebGLApplication.prototype._skeletonVizFn('Text');
 
-WebGLApplication.prototype.toggleConnectors = function() {
-  this.options.connector_filter = ! this.options.connector_filter;
+/**
+ * Allow only connectors that have more than one partner in the current
+ * selection
+ */
+WebGLApplication.filterSharedConnectors = function(counts) {
+  var common = {};
+  for (var connector_id in counts) {
+    if (counts.hasOwnProperty(connector_id) && counts[connector_id].length > 1) {
+      common[connector_id] = null; // null, just to add something
+    }
+  }
+  return common;
+};
 
-  var f = this.options.connector_filter;
+/**
+ * Allow only connectors that have more than one partner in the current
+ * selection
+ */
+WebGLApplication.filterPrePostConnectors = function(counts) {
+  var common = {};
+  for (var connector_id in counts) {
+    if (counts.hasOwnProperty(connector_id) &&
+        counts[connector_id].some(isPresynaptic) &&
+        counts[connector_id].some(isPostsynaptic)) {
+      common[connector_id] = null; // null, just to add something
+    }
+  }
+  return common;
+
+  function isPresynaptic(value) { return 'presynaptic_to' === value[1]; }
+  function isPostsynaptic(value) { return 'postsynaptic_to' === value[1]; }
+};
+
+/**
+ * Allow only connectors that have more than one partner in the current
+ * selection and that connect skeletons between the two groups.
+ */
+WebGLApplication.filterGroupSharedConnectors = function(group1, group2, onlyPrePost, counts) {
+  // Find all shared connecors
+  var common = {};
+  for (var connector_id in counts) {
+    if (counts.hasOwnProperty(connector_id)) {
+      // Only allow connectors that connect to both source groups, find links to
+      // each group from the current connector.
+      var inSource1 = [], inSource2 = [];
+      for (var i=0; i<counts[connector_id].length; ++i) {
+        var link = counts[connector_id][i];
+        if (group1.hasOwnProperty(link[0])) inSource1.push(link);
+        if (group2.hasOwnProperty(link[0])) inSource2.push(link);
+      }
+
+      // For being visible, the connector has to have links into both groups
+      var visible = inSource1.length > 0 && inSource2.length > 0;
+      // If at least one pre-post-connection between the two groups is required,
+      // check for this.
+      if (visible && onlyPrePost) {
+        var preIn1 = inSource1.some(isPresynaptic);
+        var preIn2 = inSource2.some(isPresynaptic);
+        var postIn1 = inSource1.some(isPostsynaptic);
+        var postIn2 = inSource2.some(isPostsynaptic);
+        visible = (preIn1 && postIn2 ) || (preIn2 && postIn1);
+      }
+
+      if (visible) {
+        common[connector_id] = null; // null, just to add something
+      }
+    }
+  }
+
+  return common;
+
+  function isPresynaptic(value) { return 'presynaptic_to' === value[1]; }
+  function isPostsynaptic(value) { return 'postsynaptic_to' === value[1]; }
+};
+
+/**
+ * Get user input for creating a goup share filter for connectors. It requires
+ * two skeleton sources that form the groups between which connectors are
+ * allowed.
+ */
+WebGLApplication.makeGroupShareConnectorFilter = function(onlyPrePost, callback) {
+  var source1, source2;
+
+  // Add skeleton source message and controls
+  var dialog = new CATMAID.OptionsDialog('Select groups');
+
+  // Add user interface
+  dialog.appendMessage('Please select two skeleton sources that represent ' +
+      'groups. Only connections between neurons visible in the 3D viewer ' +
+      'that link neurons from one group to the other will be shown.');
+  var source1Input = addSourceInput(dialog.dialog, "Source 1:");
+  var source2Input = addSourceInput(dialog.dialog, "Source 2:");
+
+  // Add handler for initiating the export
+  dialog.onOK = function() {
+    var source1 = CATMAID.skeletonListSources.getSource($(source1Input).val());
+    var source2 = CATMAID.skeletonListSources.getSource($(source2Input).val());
+    if (!source1 || !source2) {
+      CATMAID.error("Couldn't find expected skeleton sources");
+      return;
+    }
+    var group1 = source1.getSelectedSkeletonModels();
+    var group2 = source2.getSelectedSkeletonModels();
+    if (!group1 || !group2) {
+      CATMAID.error("Couldn't find expected skeleton models");
+      return;
+    }
+
+    var filter =  WebGLApplication.filterGroupSharedConnectors.bind(
+        this, group1, group2, onlyPrePost);
+
+    if (CATMAID.tools.isFn(callback)) {
+      callback(filter);
+    }
+  };
+
+  dialog.onCancel = function() {
+    if (CATMAID.tools.isFn(callback)) {
+      callback(null);
+    }
+  };
+
+  dialog.show(350, 250, true);
+
+  function addSourceInput(d, name) {
+    var select = document.createElement('select');
+    CATMAID.skeletonListSources.createOptions().forEach(function(option, i) {
+      select.options.add(option);
+      if (option.value === 'Active skeleton') select.selectedIndex = i;
+    });
+    var label_p = document.createElement('p');
+    var label = document.createElement('label');
+    label.appendChild(document.createTextNode(name));
+    label.appendChild(select);
+    label_p.appendChild(label);
+    d.appendChild(label_p);
+    return select;
+  }
+};
+
+WebGLApplication.prototype.setConnectorRestriction = function(restriction) {
+  var self = this;
+
+  if ('none' === restriction) {
+    this.options.connector_filter = false;
+  } else if ('all-shared' === restriction) {
+    this.options.connector_filter = WebGLApplication.filterSharedConnectors;
+  } else if ('all-pre-post' === restriction) {
+    this.options.connector_filter = WebGLApplication.filterPrePostConnectors;
+  } else if ('all-group-shared' === restriction ||
+      'all-group-shared-pre-post' === restriction) {
+    var onlyPrePost = 'all-group-shared-pre-post' === restriction;
+    WebGLApplication.makeGroupShareConnectorFilter(onlyPrePost, function(filter) {
+      if (filter) {
+        self.options.connector_filter = filter;
+        self.refreshRestrictedConnectors();
+      }
+    });
+    // Prevent application of filter. This is done in function above, once user
+    // input is complete.
+    return;
+  } else {
+    throw new CATMAID.ValueError('Unknown connector restriction: ' + restriction);
+  }
+
+  this.refreshRestrictedConnectors();
+};
+
+WebGLApplication.prototype.refreshRestrictedConnectors = function() {
+  // Display regular markers only if no restriction is used
   var skeletons = this.space.content.skeletons;
   var skids = Object.keys(skeletons);
-
+  var regularMarkerVisible = this.options.connector_filter ? false : true;
   skids.forEach(function(skid) {
-    skeletons[skid].setPreVisibility( !f );
-    skeletons[skid].setPostVisibility( !f );
-    $('#skeletonpre-'  + skid).attr('checked', !f );
-    $('#skeletonpost-' + skid).attr('checked', !f );
+    skeletons[skid].setPreVisibility(regularMarkerVisible);
+    skeletons[skid].setPostVisibility(regularMarkerVisible);
+    $('#skeletonpre-'  + skid).attr('checked', regularMarkerVisible);
+    $('#skeletonpost-' + skid).attr('checked', regularMarkerVisible);
   });
 
-  if (this.options.connector_filter) {
-    this.refreshRestrictedConnectors();
+	if (this.options.connector_filter) {
+    var restriction = this.options.connector_filter;
+
+    // Find all connector IDs referred to by more than one skeleton
+    // but only for visible skeletons
+    var visible_skeletons = Object.keys(skeletons).filter(function(skeleton_id) {
+      return skeletons[skeleton_id].visible;
+    });
+    var synapticTypes = this.space.Skeleton.prototype.synapticTypes;
+
+    // Map all connectors to the skeletons they connect to
+    var counts = visible_skeletons.reduce(function(counts, skeleton_id) {
+      return synapticTypes.reduce(function(counts, type) {
+        var vertices = skeletons[skeleton_id].geometry[type].vertices;
+        // Vertices is an array of Vector3, every two a pair, the first at the
+        // connector and the second at the node
+        for (var i=vertices.length-2; i>-1; i-=2) {
+          var connector_id = vertices[i].node_id;
+          if (!counts.hasOwnProperty(connector_id)) {
+            counts[connector_id] = [];
+          }
+          // Store a reference to the type for each connector
+          counts[connector_id].push([skeleton_id, type]);
+        }
+        return counts;
+      }, counts);
+    }, {});
+
+    // Filter all connectors
+    var common = restriction(counts);
+
+    var visible_set = visible_skeletons.reduce(function(o, skeleton_id) {
+      o[skeleton_id] = null;
+      return o;
+    }, {});
+
+    for (var skeleton_id in skeletons) {
+      if (skeletons.hasOwnProperty(skeleton_id)) {
+        skeletons[skeleton_id].remove_connector_selection();
+        if (skeleton_id in visible_set) {
+          skeletons[skeleton_id].create_connector_selection( common );
+        }
+      }
+    }
   } else {
     skids.forEach(function(skid) {
       skeletons[skid].remove_connector_selection();
     });
-    this.space.render();
   }
-};
-
-WebGLApplication.prototype.refreshRestrictedConnectors = function() {
-	if (!this.options.connector_filter) return;
-	// Find all connector IDs referred to by more than one skeleton
-	// but only for visible skeletons
-	var skeletons = this.space.content.skeletons;
-	var visible_skeletons = Object.keys(skeletons).filter(function(skeleton_id) { return skeletons[skeleton_id].visible; });
-  var synapticTypes = this.space.Skeleton.prototype.synapticTypes;
-
-	var counts = visible_skeletons.reduce(function(counts, skeleton_id) {
-    return synapticTypes.reduce(function(counts, type) {
-      var vertices = skeletons[skeleton_id].geometry[type].vertices;
-      // Vertices is an array of Vector3, every two a pair, the first at the connector and the second at the node
-      for (var i=vertices.length-2; i>-1; i-=2) {
-        var connector_id = vertices[i].node_id;
-        if (!counts.hasOwnProperty(connector_id)) {
-          counts[connector_id] = {};
-        }
-        counts[connector_id][skeleton_id] = null;
-      }
-      return counts;
-    }, counts);
-  }, {});
-
-	var common = {};
-	for (var connector_id in counts) {
-		if (counts.hasOwnProperty(connector_id) && Object.keys(counts[connector_id]).length > 1) {
-			common[connector_id] = null; // null, just to add something
-		}
-	}
-
-  var visible_set = visible_skeletons.reduce(function(o, skeleton_id) {
-    o[skeleton_id] = null;
-    return o;
-  }, {});
-
-  for (var skeleton_id in skeletons) {
-    if (skeletons.hasOwnProperty(skeleton_id)) {
-      skeletons[skeleton_id].remove_connector_selection();
-      if (skeleton_id in visible_set) {
-        skeletons[skeleton_id].create_connector_selection( common );
-      }
-    }
-	}
 
 	this.space.render();
 };
@@ -378,19 +1085,7 @@ WebGLApplication.prototype.set_shading_method = function() {
   // Set the shading of all skeletons based on the state of the "Shading" pop-up menu.
   this.options.shading_method = $('#skeletons_shading' + this.widgetID + ' :selected').attr("value");
 
-  var skeletons = this.space.content.skeletons;
-  try {
-    $.blockUI();
-    Object.keys(skeletons).forEach(function(skid) {
-      skeletons[skid].updateSkeletonColor(this.options);
-    }, this);
-  } catch (e) {
-    console.log(e, e.stack);
-    alert(e);
-  }
-  $.unblockUI();
-
-  this.space.render();
+  this.updateSkeletonColors();
 };
 
 WebGLApplication.prototype.look_at_active_node = function() {
@@ -409,6 +1104,10 @@ WebGLApplication.prototype.updateActiveNodePosition = function() {
 WebGLApplication.prototype.staticUpdateActiveNodePosition = function() {
   this.getInstances().map(function(instance) {
     instance.updateActiveNodePosition();
+    // Center the active node, if wanted
+    if (instance.options.follow_active) {
+      instance.look_at_active_node();
+    }
   });
 };
 
@@ -441,6 +1140,7 @@ WebGLApplication.prototype.addSkeletons = function(models, callback) {
       skeleton.setPreVisibility(model.pre_visible);
       skeleton.setPostVisibility(model.post_visible);
       skeleton.setTextVisibility(model.text_visible);
+      skeleton.setMetaVisibility(model.meta_visible);
       skeleton.actorColor = model.color.clone();
       skeleton.opacity = model.opacity;
       skeleton.updateSkeletonColor(this.options);
@@ -457,30 +1157,32 @@ WebGLApplication.prototype.addSkeletons = function(models, callback) {
       url2 = '/' + lean  + '/' + lean + '/compact-skeleton';
 
 
-  fetchSkeletons(
-      skeleton_ids,
-      function(skeleton_id) {
-        return url1 + skeleton_id + url2;
-      },
-      function(skeleton_id) {
-        return {}; // the post
-      },
-      (function(skeleton_id, json) {
-        var sk = this.space.updateSkeleton(models[skeleton_id], json, options);
-        if (sk) sk.show(this.options);
-      }).bind(this),
-      function(skeleton_id) {
-        // Failed loading: will be handled elsewhere via fnMissing in fetchCompactSkeletons
-      },
-      (function() {
-        this.updateSkeletonColors(
-          (function() {
-              if (this.options.connector_filter) this.refreshRestrictedConnectors();
-              if (typeof callback === "function") {
-                try { callback(); } catch (e) { alert(e); }
-              }
-          }).bind(this));
-      }).bind(this));
+  // Register with the neuron name service and fetch the skeleton data
+  NeuronNameService.getInstance().registerAll(this, models,
+    fetchSkeletons.bind(this,
+        skeleton_ids,
+        function(skeleton_id) {
+          return url1 + skeleton_id + url2;
+        },
+        function(skeleton_id) {
+          return {}; // the post
+        },
+        (function(skeleton_id, json) {
+          var sk = this.space.updateSkeleton(models[skeleton_id], json, options);
+          if (sk) sk.show(this.options);
+        }).bind(this),
+        function(skeleton_id) {
+          // Failed loading: will be handled elsewhere via fnMissing in fetchCompactSkeletons
+        },
+        (function() {
+          this.updateSkeletonColors(
+            (function() {
+                if (this.options.connector_filter) this.refreshRestrictedConnectors();
+                if (typeof callback === "function") {
+                  try { callback(); } catch (e) { alert(e); }
+                }
+            }).bind(this));
+        }).bind(this)));
 };
 
 /** Reload skeletons from database. */
@@ -490,9 +1192,21 @@ WebGLApplication.prototype.updateSkeletons = function() {
   this.append(models);
 };
 
+WebGLApplication.prototype.updateActiveSkeleton = function() {
+  var skid = SkeletonAnnotations.getActiveSkeletonId();
+  if (undefined === skid) return CATMAID.info("No active skeleton");
+  var sk = this.space.content.skeletons[skid];
+  if (!sk) return CATMAID.info("Active skeleton is not present in the 3D viewer");
+  // Remove and re-add (without removing, only properties are updated upon append, not the geometry)
+  this.space.removeSkeleton(sk.id);
+  var models = {};
+  models[sk.id] = sk.skeletonmodel;
+  this.append(models);
+};
+
 WebGLApplication.prototype.append = function(models) {
   if (0 === Object.keys(models).length) {
-    growlAlert("Info", "No skeletons selected!");
+    CATMAID.info("No skeletons selected!");
     return;
   }
   this.addSkeletons(models, false);
@@ -551,267 +1265,11 @@ WebGLApplication.prototype.showActiveNode = function() {
 };
 
 
-WebGLApplication.prototype.configureParameters = function() {
-  var space = this.space;
-  var options = this.options;
-  var updateSkeletons = this.updateSkeletons.bind(this);
-
-  var dialog = document.createElement('div');
-  dialog.setAttribute("id", "dialog-confirm");
-  dialog.setAttribute("title", "Configuration");
-
-  var msg = document.createElement('p');
-  msg.innerHTML = "Missing sections height [0,100]:";
-  dialog.appendChild(msg);
-
-  var missingsectionheight = document.createElement('input');
-  missingsectionheight.setAttribute("type", "text");
-  missingsectionheight.setAttribute("id", "missing-section-height");
-  missingsectionheight.setAttribute("value", options.missing_section_height);
-  dialog.appendChild(missingsectionheight);
-  dialog.appendChild(document.createElement("br"));
-
-  var bzplane = document.createElement('input');
-  bzplane.setAttribute("type", "checkbox");
-  bzplane.setAttribute("id", "enable_z_plane");
-  bzplane.setAttribute("value", "Enable z-plane");
-  if ( options.show_zplane )
-    bzplane.setAttribute("checked", "true");
-  dialog.appendChild(bzplane);
-  dialog.appendChild(document.createTextNode('Enable z-plane'));
-  dialog.appendChild(document.createElement("br"));
-
-  var bmeshes = document.createElement('input');
-  bmeshes.setAttribute("type", "checkbox");
-  bmeshes.setAttribute("id", "show_meshes");
-  bmeshes.setAttribute("value", "Show meshes");
-  if( options.show_meshes )
-    bmeshes.setAttribute("checked", "true");
-  dialog.appendChild(bmeshes);
-  dialog.appendChild(document.createTextNode('Show meshes, with color: '));
-
-  var c = $(document.createElement("button")).attr({
-      id: 'meshes-color',
-      value: 'color'
-    })
-      .css('background-color', options.meshes_color)
-      .click( function( event )
-      {
-        var sel = $('#meshes-colorwheel');
-
-        if (sel.is(':hidden')) {
-          var cw = Raphael.colorwheel(sel[0], 150);
-          cw.color($('#meshes-color').css('background-color'),
-                   $('#meshes-opacity').text());
-          cw.onchange(function(color, alpha) {
-            color = new THREE.Color().setRGB(parseInt(color.r) / 255.0,
-                parseInt(color.g) / 255.0, parseInt(color.b) / 255.0);
-            $('#meshes-color').css('background-color', color.getStyle());
-            $('#meshes-opacity').text(alpha.toFixed(2));
-            if (options.show_meshes) {
-              var material = options.createMeshMaterial(color, alpha);
-              space.content.meshes.forEach(function(mesh) {
-                mesh.material = material;
-              });
-              space.render();
-            }
-          });
-          sel.show();
-        } else {
-          sel.hide();
-          sel.empty();
-        }
-      })
-      .text('color')
-      .get(0);
-  dialog.appendChild(c);
-  dialog.appendChild($(
-    '<span>(Opacity: <span id="meshes-opacity">' +
-      options.meshes_opacity + '</span>)</span>').get(0));
-  dialog.appendChild($('<div id="meshes-colorwheel">').hide().get(0));
-  dialog.appendChild(document.createElement("br"));
-
-  var bactive = document.createElement('input');
-  bactive.setAttribute("type", "checkbox");
-  bactive.setAttribute("id", "enable_active_node");
-  bactive.setAttribute("value", "Enable active node");
-  if( options.show_active_node )
-    bactive.setAttribute("checked", "true");
-  dialog.appendChild(bactive);
-  dialog.appendChild(document.createTextNode('Enable active node'));
-  dialog.appendChild(document.createElement("br"));
-
-  var bmissing = document.createElement('input');
-  bmissing.setAttribute("type", "checkbox");
-  bmissing.setAttribute("id", "enable_missing_sections");
-  bmissing.setAttribute("value", "Missing sections");
-  if( options.show_missing_sections )
-    bmissing.setAttribute("checked", "true");
-  dialog.appendChild(bmissing);
-  dialog.appendChild(document.createTextNode('Missing sections'));
-  dialog.appendChild(document.createElement("br"));
-
-  /*var bortho = document.createElement('input');
-  bortho.setAttribute("type", "checkbox");
-  bortho.setAttribute("id", "toggle_ortho");
-  bortho.setAttribute("value", "Toggle Ortho");
-  container.appendChild(bortho);
-  container.appendChild(document.createTextNode('Toggle Ortho'));*/
-
-  var bfloor = document.createElement('input');
-  bfloor.setAttribute("type", "checkbox");
-  bfloor.setAttribute("id", "toggle_floor");
-  bfloor.setAttribute("value", "Toggle Floor");
-  if( options.show_floor )
-    bfloor.setAttribute("checked", "true");
-  dialog.appendChild(bfloor);
-  dialog.appendChild(document.createTextNode('Toggle floor'));
-  dialog.appendChild(document.createElement("br"));
-
-  var bbox = document.createElement('input');
-  bbox.setAttribute("type", "checkbox");
-  bbox.setAttribute("id", "toggle_aabb");
-  bbox.setAttribute("value", "Toggle Bounding Box");
-  if( options.show_box )
-    bbox.setAttribute("checked", "true");
-  dialog.appendChild(bbox);
-  dialog.appendChild(document.createTextNode('Toggle Bounding Box'));
-  dialog.appendChild(document.createElement("br"));
-
-  var bbackground = document.createElement('input');
-  bbackground.setAttribute("type", "checkbox");
-  bbackground.setAttribute("id", "toggle_bgcolor");
-  bbackground.setAttribute("value", "Toggle Background Color");
-  if( options.show_background )
-    bbackground.setAttribute("checked", "true");
-  dialog.appendChild(bbackground);
-  dialog.appendChild(document.createTextNode('Toggle Background Color'));
-  dialog.appendChild(document.createElement("br"));
-
-  var blean = document.createElement('input');
-  blean.setAttribute("type", "checkbox");
-  blean.setAttribute("id", "toggle_lean");
-  if( options.lean_mode )
-    blean.setAttribute("checked", "true");
-  dialog.appendChild(blean);
-  dialog.appendChild(document.createTextNode('Toggle lean mode (no synapses, no tags)'));
-  dialog.appendChild(document.createElement("br"));
-
-  dialog.appendChild(document.createTextNode('Synapse clustering bandwidth: '));
-  var ibandwidth = document.createElement('input');
-  ibandwidth.setAttribute('type', 'text');
-  ibandwidth.setAttribute('id', 'synapse-clustering-bandwidth');
-  ibandwidth.setAttribute('value', options.synapse_clustering_bandwidth);
-  ibandwidth.setAttribute('size', '7');
-  dialog.appendChild(ibandwidth);
-  dialog.appendChild(document.createTextNode(' nm.'));
-  dialog.appendChild(document.createElement("br"));
-
-  var optionField = function(label, units, size, checkboxKey, valueKey) {
-    var checkbox;
-    if (checkboxKey) {
-      checkbox = document.createElement('input');
-      checkbox.setAttribute("type", "checkbox");
-      if (options[checkboxKey])
-        checkbox.setAttribute("checked", true);
-      dialog.appendChild(checkbox);
-    }
-    dialog.appendChild(document.createTextNode(label));
-    var number = document.createElement('input');
-    number.setAttribute('type', 'text');
-    number.setAttribute('value', options[valueKey]);
-    number.setAttribute('size', size);
-    dialog.appendChild(number);
-    dialog.appendChild(document.createTextNode(units));
-    dialog.appendChild(document.createElement("br"));
-    return [checkbox, number];
-  };
-
-  var smooth = optionField('Toggle smoothing skeletons by Gaussian convolution of the slabs, with sigma: ', ' nm.', 5, 'smooth_skeletons', 'smooth_skeletons_sigma');
-
-  var resample = optionField('Toogle resampling skeleton slabs, with delta: ', ' nm.', 5, 'resample_skeletons', 'resampling_delta');
-
-  var linewidth = optionField('Skeleton rendering line width: ', ' pixels.', 5, null, 'skeleton_line_width');
-
-  var submit = this.submit;
-
-  $(dialog).dialog({
-    height: 440,
-    width: 600,
-    modal: true,
-    buttons: {
-      "Cancel": function() {
-        $(this).dialog("close");
-      },
-      "OK": function() {
-        var missing_section_height = missingsectionheight.value;  
-        try {
-          missing_section_height = parseInt(missing_section_height);
-          if (missing_section_height < 0) missing_section_height = 20;
-        } catch (e) {
-          alert("Invalid value for the height of missing sections!");
-        }
-
-        options.missing_section_height = missing_section_height;
-        options.show_zplane = bzplane.checked;
-        options.show_missing_sections = bmissing.checked;
-        options.show_floor = bfloor.checked;
-        options.show_box = bbox.checked;
-        options.show_background = bbackground.checked;
-
-        options.show_active_node = bactive.checked;
-        options.show_meshes = bmeshes.checked;
-        options.meshes_color = $('#meshes-color').css('background-color').replace(/\s/g, '');
-        options.meshes_opacity = $('#meshes-opacity').text();
-        options.lean_mode = blean.checked;
-
-        var read = function(checkbox, checkboxKey, valueField, valueKey) {
-          var old_value = options[checkboxKey];
-          if (checkbox) options[checkboxKey] = checkbox.checked;
-          try {
-            var new_value = parseInt(valueField.value);
-            if (new_value > 0) {
-              options[valueKey] = new_value;
-              return old_value != new_value;
-            } else alert("'" + valueKey + "' must be larger than zero.");
-          } catch (e) {
-            alert("Invalid value for '" + valueKey + "': " + valueField.value);
-          }
-          return false;
-        };
-
-        var changed_sigma = read(smooth[0], 'smooth_skeletons', smooth[1], 'smooth_skeletons_sigma'),
-            changed_bandwidth = read(null, null, ibandwidth, 'synapse_clustering_bandwidth', null),
-            changed_delta = read(resample[0], 'resample_skeletons', resample[1], 'resampling_delta'),
-            changed_line_width = read(null, null, linewidth[1], 'skeleton_line_width', null);
-
-        space.staticContent.adjust(options, space);
-        space.content.adjust(options, space, submit, changed_bandwidth, changed_line_width);
-
-        // Copy
-        WebGLApplication.prototype.OPTIONS = options.clone();
-
-        if (changed_sigma || changed_delta) updateSkeletons();
-        else space.render();
-
-        $(this).dialog("close");
-      }
-    },
-    close: function(event, ui) {
-      $('#dialog-confirm').remove();
-
-      // Remove the binding
-      $(document).off('keyup', "#meshes-color");
-    }
-  });
-};
-
-
-
 /** Defines the properties of the 3d space and also its static members like the bounding box and the missing sections. */
-WebGLApplication.prototype.Space = function( w, h, container, stack ) {
+WebGLApplication.prototype.Space = function( w, h, container, stack, options ) {
 	this.stack = stack;
   this.container = container; // used by MouseControls
+  this.options = options;
 
 	this.canvasWidth = w;
 	this.canvasHeight = h;
@@ -823,18 +1281,31 @@ WebGLApplication.prototype.Space = function( w, h, container, stack ) {
                                       stack.dimension.y * stack.resolution.y,
                                       stack.dimension.z * stack.resolution.z);
 
+	// Set the node scaling for skeletons so that it makes nodes not too big for
+	// higher resolutions and not too small for lower ones.
+	options.skeleton_node_scaling = 2 * Math.min(stack.resolution.x,
+	    stack.resolution.y, stack.resolution.z);
+	// Make the scaling factor look a bit prettier by rounding to two decimals
+	options.skeleton_node_scaling = Number(options.skeleton_node_scaling.toFixed(2));
+
 	// WebGL space
 	this.scene = new THREE.Scene();
+	// A render target used for picking objects
+	this.pickingTexture = new THREE.WebGLRenderTarget(w, h);
+	this.pickingTexture.generateMipmaps = false;
+
 	this.view = new this.View(this);
 	this.lights = this.createLights(stack.dimension, stack.resolution, this.view.camera);
-	this.lights.forEach(this.scene.add, this.scene);
+	this.lights.forEach(function(l) {
+		this.add(l);
+	}, this.scene);
 
 	// Content
-	this.staticContent = new this.StaticContent(this.dimensions, stack, this.center);
+	this.staticContent = new this.StaticContent(this.dimensions, stack, this.center, options);
 	this.scene.add(this.staticContent.box);
 	this.scene.add(this.staticContent.floor);
 
-	this.content = new this.Content();
+	this.content = new this.Content(options);
 	this.scene.add(this.content.active_node.mesh);
 };
 
@@ -844,8 +1315,12 @@ WebGLApplication.prototype.Space.prototype.setSize = function(canvasWidth, canva
 	this.canvasWidth = canvasWidth;
 	this.canvasHeight = canvasHeight;
 	this.view.camera.setSize(canvasWidth, canvasHeight);
-	this.view.camera.toPerspective(); // invokes update of camera matrices
+	this.view.camera.updateProjectionMatrix();
+	this.pickingTexture.setSize(canvasWidth, canvasHeight);
 	this.view.renderer.setSize(canvasWidth, canvasHeight);
+	if (this.view.controls) {
+		this.view.controls.handleResize();
+	}
 };
 
 /** Transform a THREE.Vector3d from stack coordinates to Space coordinates.
@@ -923,7 +1398,7 @@ WebGLApplication.prototype.Space.prototype.render = function() {
 WebGLApplication.prototype.Space.prototype.destroy = function() {
   // remove active_node and project-wise meshes
 	this.scene.remove(this.content.active_node.mesh);
-	this.content.meshes.forEach(this.scene.remove, this.scene);
+	this.content.meshes.forEach(function(m) { this.remove(m); }, this.scene);
 
   // dispose active_node and meshes
   this.content.dispose();
@@ -931,7 +1406,7 @@ WebGLApplication.prototype.Space.prototype.destroy = function() {
   // dispose and remove skeletons
   this.removeSkeletons(Object.keys(this.content.skeletons));
 
-	this.lights.forEach(this.scene.remove, this.scene);
+	this.lights.forEach(function(l) { this.remove(l); }, this.scene);
 
   // dispose meshes and materials
   this.staticContent.dispose();
@@ -940,7 +1415,7 @@ WebGLApplication.prototype.Space.prototype.destroy = function() {
 	this.scene.remove(this.staticContent.box);
 	this.scene.remove(this.staticContent.floor);
 	if (this.staticContent.zplane) this.scene.remove(this.staticContent.zplane);
-	this.staticContent.missing_sections.forEach(this.scene.remove, this.scene);
+	this.staticContent.missing_sections.forEach(function(m) { this.remove(m); }, this.scene);
 
 	this.view.destroy();
 
@@ -959,7 +1434,7 @@ WebGLApplication.prototype.Space.prototype.removeSkeleton = function(skeleton_id
 };
 
 WebGLApplication.prototype.Space.prototype.updateSplitShading = function(old_skeleton_id, new_skeleton_id, options) {
-  if ('active_node_split' === options.shading_method) {
+  if ('active_node_split' === options.shading_method || 'near_active_node' === options.shading_method) {
     if (old_skeleton_id !== new_skeleton_id) {
       if (old_skeleton_id && old_skeleton_id in this.content.skeletons) this.content.skeletons[old_skeleton_id].updateSkeletonColor(options);
     }
@@ -967,6 +1442,44 @@ WebGLApplication.prototype.Space.prototype.updateSplitShading = function(old_ske
   }
 };
 
+/**
+ * Return an object containing visibility information on all loaded skeleton.
+ */
+WebGLApplication.prototype.Space.prototype.getVisibilityMap = function()
+{
+  var visibilityMap = {};
+  for (var skid in this.content.skeletons) {
+    var s = this.content.skeletons[skid];
+    visibilityMap[skid] = {
+      actor: s.visible,
+      pre: s.skeletonmodel.pre_visible,
+      post: s.skeletonmodel.post_visible,
+      text: s.skeletonmodel.text_visible,
+      meta: s.skeletonmodel.meta_visible
+    };
+  }
+
+  return visibilityMap;
+};
+
+/**
+ * Updates the visibility of all skeletons. If a skeleton ID is given as a
+ * second argument, only this skeleton will be set visible (if it was visible
+ * before), otherwise all skeletons are set to the state in the given map.
+ */
+WebGLApplication.prototype.Space.prototype.setSkeletonVisibility = function(
+    visMap, visibleSkids)
+{
+  for (var skid in this.content.skeletons) {
+    var s = this.content.skeletons[skid];
+    var visible = visibleSkids ? (-1 !== visibleSkids.indexOf(skid)) : true;
+    s.setActorVisibility(visMap[skid].actor ? visible : false);
+    s.setPreVisibility(visMap[skid].pre ? visible : false);
+    s.setPostVisibility(visMap[skid].post ? visible : false);
+    s.setTextVisibility(visMap[skid].text ? visible : false);
+    s.setMetaVisibility(visMap[skid].meta ? visible : false);
+  }
+};
 
 WebGLApplication.prototype.Space.prototype.TextGeometryCache = function() {
 	this.geometryCache = {};
@@ -1009,8 +1522,8 @@ WebGLApplication.prototype.Space.prototype.TextGeometryCache = function() {
 
   this.destroy = function() {
     Object.keys(this.geometryCache).forEach(function(entry) {
-      entry.geometry.dispose();
-    });
+      this[entry].geometry.dispose();
+    }, this.geometryCache);
     delete this.geometryCache;
   };
 };
@@ -1025,8 +1538,8 @@ WebGLApplication.prototype.Space.prototype.StaticContent = function(dimensions, 
 	this.missing_sections = [];
 
 	// Shared across skeletons
-  this.labelspheregeometry = new THREE.OctahedronGeometry( 130, 3);
-  this.radiusSphere = new THREE.OctahedronGeometry( 40, 3);
+  this.labelspheregeometry = new THREE.OctahedronGeometry(32, 3);
+  this.radiusSphere = new THREE.OctahedronGeometry(10, 3);
   this.icoSphere = new THREE.IcosahedronGeometry(1, 2);
   this.cylinder = new THREE.CylinderGeometry(1, 1, 1, 10, 1, false);
   this.textMaterial = new THREE.MeshNormalMaterial( { color: 0xffffff, overdraw: true } );
@@ -1071,14 +1584,66 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.dispose = fun
 };
 
 WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createBoundingBox = function(center, dimension, resolution) {
-  var width = dimension.x * resolution.x;
-  var height = dimension.y * resolution.y;
-  var depth = dimension.z * resolution.z;
-  var geometry = new THREE.CubeGeometry( width, height, depth );
-  var material = new THREE.MeshBasicMaterial( { color: 0xff0000, wireframe: true } );
-  var mesh = new THREE.Mesh( geometry, material );
+  var w2 = (dimension.x * resolution.x) / 2;
+  var h2 = (dimension.y * resolution.y) / 2;
+  var d2 = (dimension.z * resolution.z) / 2;
+
+  var geometry = new THREE.Geometry();
+
+  geometry.vertices.push(
+    new THREE.Vector3(-w2, -h2, -d2),
+    new THREE.Vector3(-w2,  h2, -d2),
+
+    new THREE.Vector3(-w2,  h2, -d2),
+    new THREE.Vector3( w2,  h2, -d2),
+
+    new THREE.Vector3( w2,  h2, -d2),
+    new THREE.Vector3( w2, -h2, -d2),
+
+    new THREE.Vector3( w2, -h2, -d2),
+    new THREE.Vector3(-w2, -h2, -d2),
+
+
+    new THREE.Vector3(-w2, -h2,  d2),
+    new THREE.Vector3(-w2,  h2,  d2),
+
+    new THREE.Vector3(-w2,  h2,  d2),
+    new THREE.Vector3( w2,  h2,  d2),
+
+    new THREE.Vector3( w2,  h2,  d2),
+    new THREE.Vector3( w2, -h2,  d2),
+
+    new THREE.Vector3( w2, -h2,  d2),
+    new THREE.Vector3(-w2, -h2,  d2),
+
+
+    new THREE.Vector3(-w2, -h2, -d2),
+    new THREE.Vector3(-w2, -h2,  d2),
+
+    new THREE.Vector3(-w2,  h2, -d2),
+    new THREE.Vector3(-w2,  h2,  d2),
+
+    new THREE.Vector3( w2,  h2, -d2),
+    new THREE.Vector3( w2,  h2,  d2),
+
+    new THREE.Vector3( w2, -h2, -d2),
+    new THREE.Vector3( w2, -h2,  d2)
+  );
+
+  geometry.computeLineDistances();
+
+  var material = new THREE.LineBasicMaterial( { color: 0xff0000 } );
+  var mesh = new THREE.Line( geometry, material, THREE.LinePieces );
+
   mesh.position.set(center.x, center.y, center.z);
-	return mesh;
+
+  // The bounding box will not move and automatic matrix update can be disabled.
+  // However, we have to apply the initial position change by explicitely
+  // updating the matrix.
+  mesh.matrixAutoUpdate = false;
+  mesh.updateMatrix();
+
+  return mesh;
 };
 
 /**
@@ -1110,21 +1675,52 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createFloor =
         max_z = zExtent * zStep + zOffset;
 
     // Create planar mesh for floor
-    var xLines = nBaseLines + 2 * xExtent;
-    var zLines = nBaseLines + 2 * zExtent;
+    var xLines = nBaseLines + 2 * xExtent + 1;
+    var zLines = nBaseLines + 2 * zExtent + 1;
     var width = max_x - min_x;
     var height = max_z - min_z;
-    var plane = new THREE.PlaneGeometry(width, height, xLines, zLines);
-    var material = new THREE.MeshBasicMaterial({
-        color: o['color'] || 0x535353,
-        wireframe: true,
-        side: THREE.DoubleSide,
-        transparent: true
+
+    // There are two three-component positions per line
+    var positions = new Float32Array((xLines * 2 + zLines * 2) * 3);
+
+    for (var z=0; z<zLines; ++z) {
+      var i = z * 6;
+      positions[i    ] = 0;
+      positions[i + 1] = 0;
+      positions[i + 2] = z*zStep;
+
+      positions[i + 3] = width;
+      positions[i + 4] = 0;
+      positions[i + 5] = z*zStep;
+    }
+
+    for (var x=0; x<xLines; ++x) {
+      var i = zLines * 6 + x * 6;
+      positions[i    ] = x*xStep;
+      positions[i + 1] = 0;
+      positions[i + 2] = 0;
+
+      positions[i + 3] = x*xStep;
+      positions[i + 4] = 0;
+      positions[i + 5] = height;
+    }
+
+    var geometry = new THREE.BufferGeometry();
+    geometry.addAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.computeBoundingSphere();
+
+    var material = new THREE.LineBasicMaterial({
+      color: o['color'] || 0x535353
     });
-    var mesh = new THREE.Mesh(plane, material);
-    // Center the mesh and rotate it to be XZ parallel
-    mesh.position.set(min_x + 0.5 * width, floor, min_z + 0.5 * height);
-    mesh.rotation.x = Math.PI * 0.5;
+    var mesh = new THREE.Line( geometry, material, THREE.LinePieces );
+
+    mesh.position.set(min_x, floor, min_z);
+
+    // The floor will not move and automatic matrix update can be disabled.
+    // However, we have to apply the initial position change by explicitely
+    // updating the matrix.
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
 
     return mesh;
 };
@@ -1135,10 +1731,10 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.adjust = func
 	if (options.show_missing_sections) {
     if (0 === this.missing_sections.length) {
       this.missing_sections = this.createMissingSections(space, options.missing_section_height);
-      this.missing_sections.forEach(space.scene.add, space.scene);
+      this.missing_sections.forEach(function(m) { this.add(m); }, space.scene);
     }
 	} else {
-		this.missing_sections.forEach(space.scene.remove, space.scene);
+		this.missing_sections.forEach(function(m) { this.remove(m); }, space.scene);
 		this.missing_sections = [];
 	}
 
@@ -1152,34 +1748,65 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.adjust = func
 
 	this.box.visible = options.show_box;
 
-	if (this.zplane) space.scene.remove(this.zplane);
 	if (options.show_zplane) {
-		this.zplane = this.createZPlane(space.stack);
-    this.updateZPlanePosition(space.stack);
-		space.scene.add(this.zplane);
+		this.createZPlane(space, project.focusedStackViewer);
 	} else {
+		if (this.zplane) space.scene.remove(this.zplane);
 		this.zplane = null;
 	}
 };
 
-WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createZPlane = function(stack) {
-	var geometry = new THREE.Geometry(),
-	    xwidth = stack.dimension.x * stack.resolution.x,
-			ywidth = stack.dimension.y * stack.resolution.y,
+WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createZPlane = function(space, stackViewer) {
+  if (this.zplane) space.scene.remove(this.zplane);
+  var stack = stackViewer.primaryStack,
+      stackPlane = stack.createStackExtentsBox(),
+      plane = stack.createStackToProjectBox(stackPlane),
+	    geometry = new THREE.Geometry(),
 	    material = new THREE.MeshBasicMaterial( { color: 0x151349, side: THREE.DoubleSide } );
 
-	geometry.vertices.push( new THREE.Vector3( 0,0,0 ) );
-	geometry.vertices.push( new THREE.Vector3( xwidth,0,0 ) );
-	geometry.vertices.push( new THREE.Vector3( 0,ywidth,0 ) );
-	geometry.vertices.push( new THREE.Vector3( xwidth,ywidth,0 ) );
-	geometry.faces.push( new THREE.Face4( 0, 1, 3, 2 ) );
+  switch (stack.orientation) {
+    case CATMAID.Stack.ORIENTATION_XY:
+      plane.min.z = plane.max.z = 0;
+      break;
+    case CATMAID.Stack.ORIENTATION_XZ:
+      plane.min.y = plane.max.y = 0;
+      var swap = plane.min.z;
+      plane.min.z = plane.max.z;
+      plane.max.z = swap;
+      break;
+    case CATMAID.Stack.ORIENTATION_ZY:
+      plane.min.x = plane.max.x = 0;
+      break;
+  }
 
-	return new THREE.Mesh( geometry, material );
+	geometry.vertices.push( new THREE.Vector3( plane.min.x, -plane.min.y, -plane.min.z ) );
+  geometry.vertices.push( new THREE.Vector3( plane.max.x, -plane.min.y, -plane.max.z ) );
+  geometry.vertices.push( new THREE.Vector3( plane.min.x, -plane.max.y, -plane.min.z ) );
+  geometry.vertices.push( new THREE.Vector3( plane.max.x, -plane.max.y, -plane.max.z ) );
+	geometry.faces.push( new THREE.Face3( 0, 1, 2 ) );
+	geometry.faces.push( new THREE.Face3( 1, 2, 3 ) );
+
+  this.zplane = new THREE.Mesh( geometry, material );
+  space.scene.add(this.zplane);
+
+  this.updateZPlanePosition(space, stackViewer);
 };
 
-WebGLApplication.prototype.Space.prototype.StaticContent.prototype.updateZPlanePosition = function(stack) {
+WebGLApplication.prototype.Space.prototype.StaticContent.prototype.updateZPlanePosition = function(space, stackViewer) {
 	if (this.zplane) {
-		this.zplane.position.z = (-stack.z * stack.resolution.z - stack.translation.z);
+    var v = new THREE.Vector3(0, 0, 0);
+    switch (stackViewer.primaryStack.orientation) {
+      case CATMAID.Stack.ORIENTATION_XY:
+        v.z = stackViewer.primaryStack.stackToProjectZ(stackViewer.z, stackViewer.y, stackViewer.x);
+        break;
+      case CATMAID.Stack.ORIENTATION_XZ:
+        v.y = stackViewer.primaryStack.stackToProjectY(stackViewer.z, stackViewer.y, stackViewer.x);
+        break;
+      case CATMAID.Stack.ORIENTATION_ZY:
+        v.x = stackViewer.primaryStack.stackToProjectX(stackViewer.z, stackViewer.y, stackViewer.x);
+        break;
+    }
+    this.zplane.position.copy(space.toSpace(v));
 	}
 };
 
@@ -1198,7 +1825,8 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createMissing
 	geometry.vertices.push( new THREE.Vector3( xwidth,0,0 ) );
 	geometry.vertices.push( new THREE.Vector3( 0,ywidth,0 ) );
 	geometry.vertices.push( new THREE.Vector3( xwidth,ywidth,0 ) );
-	geometry.faces.push( new THREE.Face4( 0, 1, 3, 2 ) );
+	geometry.faces.push( new THREE.Face3( 0, 1, 2 ) );
+	geometry.faces.push( new THREE.Face3( 1, 2, 3 ) );
 
   return space.stack.broken_slices.reduce(function(missing_sections, sliceZ) {
 		var z = -sliceZ * r.z - t.z;
@@ -1210,11 +1838,16 @@ WebGLApplication.prototype.Space.prototype.StaticContent.prototype.createMissing
 	}, []);
 };
 
-WebGLApplication.prototype.Space.prototype.Content = function() {
-	// Scene content
-	this.active_node = new this.ActiveNode();
-	this.meshes = [];
-	this.skeletons = {};
+/**
+ * Constructor for an object that manages the content in a scene.
+ */
+WebGLApplication.prototype.Space.prototype.Content = function(options) {
+  // A representation of the active node
+  this.active_node = new this.ActiveNode(options);
+  // A list of extra meshes
+  this.meshes = [];
+  // Map of skeleton IDs to skeleton representations
+  this.skeletons = {};
 };
 
 WebGLApplication.prototype.Space.prototype.Content.prototype = {};
@@ -1261,29 +1894,19 @@ WebGLApplication.prototype.Space.prototype.Content.prototype.newJSONLoader = fun
 };
 
 /** Adjust content according to the persistent options. */
-WebGLApplication.prototype.Space.prototype.Content.prototype.adjust = function(options, space, submit, changed_bandwidth, changed_line_width) {
+WebGLApplication.prototype.Space.prototype.Content.prototype.adjust = function(options, space, submit) {
 	if (options.show_meshes) {
     if (0 === this.meshes.length) {
 		  this.loadMeshes(space, submit, options.createMeshMaterial());
     }
 	} else {
-		this.meshes.forEach(space.scene.remove, space.scene);
+		this.meshes.forEach(function(m) { this.remove(m); }, space.scene);
 		this.meshes = [];
 	}
 
 	this.active_node.setVisible(options.show_active_node);
-
-  if (changed_bandwidth && 'synapse-clustering' === options.connector_color) {
-    space.updateConnectorColors(options, Object.keys(this.skeletons).map(function(skid) { return this.skeletons[skid]; }, this));
-  }
-
-  if (changed_line_width) {
-    Object.keys(this.skeletons).forEach(function(skid) {
-      this.skeletons[skid].changeSkeletonLineWidth(options.skeleton_line_width);
-    }, this);
-  }
+	CATMAID.tools.setXYZ(this.active_node.mesh.scale, options.skeleton_node_scaling);
 };
-
 
 WebGLApplication.prototype.Space.prototype.View = function(space) {
 	this.space = space;
@@ -1303,8 +1926,8 @@ WebGLApplication.prototype.Space.prototype.View.prototype.init = function() {
   var d = this.space.dimensions;
   var fov = 75;
   var near = 1;
-  var far = 3 * Math.max(d.x, Math.max(d.y, d.z));
-  var orthoNear = 1;
+  var far = 5 * Math.max(d.x, Math.max(d.y, d.z));
+  var orthoNear = -far;
   var orthoFar =  far;
 	this.camera = new THREE.CombinedCamera(-this.space.canvasWidth,
       -this.space.canvasHeight, fov, near, far, orthoNear, orthoFar);
@@ -1312,13 +1935,13 @@ WebGLApplication.prototype.Space.prototype.View.prototype.init = function() {
 
 	this.projector = new THREE.Projector();
 
-	this.renderer = new THREE.WebGLRenderer({ antialias: true });
-  this.renderer.sortObjects = false;
-  this.renderer.setSize( this.space.canvasWidth, this.space.canvasHeight );
-
-	this.controls = this.createControls();
+	this.renderer = this.createRenderer('webgl');
 
   this.space.container.appendChild(this.renderer.domElement);
+
+  // Create controls after the renderer's DOM element has been added, so they
+  // are initialized with the correct dimensions right from the start.
+  this.controls = this.createControls();
 
   this.mouse = {position: new THREE.Vector2(),
                 is_mouse_down: false};
@@ -1330,9 +1953,9 @@ WebGLApplication.prototype.Space.prototype.View.prototype.init = function() {
   this.renderer.context.canvas.addEventListener('webglcontextlost', function(e) {
     e.preventDefault();
     // Notify user about reload
-    error("Due to limited system resources the 3D display can't be shown " +
-          "right now. Please try and restart the widget containing the 3D " +
-          "viewer.");
+    CATMAID.error("Due to limited system resources the 3D display can't be " +
+          "shown right now. Please try and restart the widget containing the " +
+          "3D viewer.");
   }, false);
   this.renderer.context.canvas.addEventListener('webglcontextrestored', (function(e) {
     // TODO: Calling init() isn't enough, but one can manually restart
@@ -1340,8 +1963,28 @@ WebGLApplication.prototype.Space.prototype.View.prototype.init = function() {
   }).bind(this), false);
 };
 
+
+/**
+ * Crate and setup a WebGL or SVG renderer.
+ */
+WebGLApplication.prototype.Space.prototype.View.prototype.createRenderer = function(type) {
+  var renderer = null;
+  if ('webgl' === type) {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+  } else if ('svg' === type) {
+    renderer = new THREE.SVGRenderer();
+  } else {
+    CATMAID.error("Unknon renderer type: " + type);
+    return null;
+  }
+
+  renderer.sortObjects = false;
+  renderer.setSize( this.space.canvasWidth, this.space.canvasHeight );
+
+  return renderer;
+};
+
 WebGLApplication.prototype.Space.prototype.View.prototype.destroy = function() {
-  this.controls.removeListeners();
   this.mouseControls.detach(this.renderer.domElement);
   this.space.container.removeChild(this.renderer.domElement);
   Object.keys(this).forEach(function(key) { delete this[key]; }, this);
@@ -1352,7 +1995,7 @@ WebGLApplication.prototype.Space.prototype.View.prototype.createControls = funct
   controls.rotateSpeed = 1.0;
   controls.zoomSpeed = 3.2;
   controls.panSpeed = 1.5;
-  controls.noZoom = false;
+  controls.noZoom = true;
   controls.noPan = false;
   controls.staticMoving = true;
   controls.dynamicDampingFactor = 0.3;
@@ -1361,13 +2004,290 @@ WebGLApplication.prototype.Space.prototype.View.prototype.createControls = funct
 };
 
 WebGLApplication.prototype.Space.prototype.View.prototype.render = function() {
-	this.controls.update();
+	if (this.controls) {
+		this.controls.update();
+	}
 	if (this.renderer) {
 		this.renderer.clear();
 		this.renderer.render(this.space.scene, this.camera);
 	}
 };
 
+/**
+ * Get the toDataURL() image data of the renderer in PNG format.
+ */
+WebGLApplication.prototype.Space.prototype.View.prototype.getImageData = function(type) {
+  type = type || "image/png";
+  return this.renderer.domElement.toDataURL(type);
+};
+
+/**
+ * Return SVG data of the rendered image. The rendered scene is slightly
+ * modified to not include the triangle-heavy spheres. Instead, these spheres
+ * are replaced with very short lines with a width that corresponds to the
+ * diameter of the sphers.
+ *
+ * If createCatalog is true, a catalog representation is crated where each
+ * neuron will be rendered in its own view, organized in a table.
+ */
+WebGLApplication.prototype.Space.prototype.View.prototype.getSVGData = function(options) {
+  var self = this;
+  var o = options || {};
+
+  // Find all spheres
+  var skeletons = this.space.content.skeletons;
+  var visibleSpheres = Object.keys(skeletons).reduce(function(o, skeleton_id) {
+    var fields = ['specialTagSpheres', 'synapticSpheres', 'radiusVolumes'];
+    var skeleton = skeletons[skeleton_id];
+    if (!skeleton.visible) return o;
+
+    var meshes = [];
+
+    // Append all spheres
+    fields.map(function(field) {
+      return skeleton[field];
+    }).forEach(function(spheres) {
+      Object.keys(spheres).forEach(function(id) {
+        var sphere = spheres[id];
+        if (sphere.visible) {
+          this.push(sphere);
+        }
+      }, this);
+    }, meshes);
+
+    o[skeleton_id] = meshes;
+
+    return o;
+  }, {});
+
+  // Hide the active node
+  var atnVisible = self.space.content.active_node.mesh.visible;
+  self.space.content.active_node.mesh.visible = false;
+
+  // Render
+  var svgData = null;
+  if ('catalog' === o['layout']) {
+    svgData = createCatalogData(visibleSpheres, o);
+  } else {
+    svgData = renderSkeletons(visibleSpheres);
+  }
+
+  // Show active node, if it was visible before
+  self.space.content.active_node.mesh.visible = atnVisible;
+
+  // Let 3D viewer update
+  self.space.render();
+
+  return svgData;
+
+  /**
+   * Set visibility of the given meshes.
+   */
+  function setVisibility(meshes, value)
+  {
+    // Hide all sphere meshes
+    meshes.forEach(function(mesh) {
+      mesh.visible = value;
+    });
+  }
+
+  function addSphereReplacements(meshes, scene)
+  {
+    // Spheres will be replaced with very short lines
+    var geometry = new THREE.Geometry();
+    geometry.vertices.push(new THREE.Vector3(0, 0, 0));
+    geometry.vertices.push(new THREE.Vector3(0, 0, 1));
+    geometry.computeLineDistances();
+
+    var addedData = {
+      m: {},
+      g: geometry,
+      d: []
+    };
+
+    var tmp = new THREE.Vector3();
+    var line = new THREE.Line3();
+    var screenXWorld = new THREE.Vector3(1,0,0).unproject(self.camera).normalize();
+    addedData.d = meshes.map(function(mesh) {
+      var hex = mesh.material.color.getHexString();
+      // Get radius of sphere in 3D world coordinates, but only use a 3x3 world
+      // matrix, since we don't need the translation.
+      var r = tmp.set(mesh.geometry.boundingSphere.radius,0,0)
+                    .applyMatrix3(mesh.matrixWorld).length();
+      // The radius has to be corrected for perspective
+      var sr = tmp.copy(screenXWorld).multiplyScalar(r);
+      line.set(mesh.position.clone(), sr.add(mesh.position));
+      line.start.project(self.camera);
+      line.end.project(self.camera);
+      // The projected line distance is given in a screen space that ranges from
+      // (-1,-1) to (1,1). We therefore have to divide by 2 to get a normalized
+      // value that we can use to create actual screen distances.  For the final
+      // length, there is no need to be more precise than 1 decimal
+      var l = (0.5 * line.distance() * self.space.canvasWidth).toFixed(1);
+      // Get material from index or create a new one
+      var key = hex + "-" + l;
+      var material = this.m[key];
+      if (!material) {
+        material = new THREE.LineBasicMaterial({
+          color: mesh.material.color.clone(),
+          linewidth: l
+        });
+        this.m[key] = material;
+      }
+      var newMesh = new THREE.Line( this.g, material, THREE.LinePieces );
+      // Move new mesh to position of replaced mesh and adapt size
+      newMesh.position.copy(mesh.position);
+      scene.add(newMesh);
+      return newMesh;
+    }, addedData);
+
+    return addedData;
+  }
+
+  function removeSphereReplacements(addedData, scene)
+  {
+    addedData.d.forEach(function(m) { scene.remove(m); });
+    Object.keys(addedData.m).forEach(function(m) {
+      this[m].dispose();
+    }, addedData.m);
+    addedData.g.dispose();
+  }
+
+  /**
+   * Create an SVG catalog of the current view.
+   */
+  function createCatalogData(sphereMeshes, options)
+  {
+    // Sort skeletons
+    var skeletons;
+    if (options['skeletons']) {
+      // Make sure all requested skeletons are actually part of the 3D view
+      var existingSkids = Object.keys(self.space.content.skeletons);
+      options['skeletons'].forEach(function(s) {
+        if (-1 === existingSkids.indexOf(s)) {
+          throw "Only skeletons currently loaded in the 3D viewer can be exported";
+        }
+      });
+      skeletons = options['skeletons'];
+    } else {
+      // If no skeletons where given, don't try to sort
+      skeletons = Object.keys(self.space.content.skeletons);
+    }
+
+    // SVG namespace to use
+    var namespace = 'http://www.w3.org/2000/svg';
+    // Size of the label text
+    var fontsize = options['fontsize'] || 14;
+    var displayNames = options['displaynames'] === undefined ? true : options['displaynames'];
+
+    // Margin of whole document
+    var margin = options['margin'] || 10;
+    // Padding around each sub-svg
+    var padding = options['padding'] || 10;
+
+    var imageWidth = self.space.canvasWidth;
+    var imageHeight = self.space.canvasHeight;
+    var numColumns = options['columns'] || 2;
+    var numRows = Math.ceil(skeletons.length / numColumns);
+
+    // Crate a map of current visibility
+    var visibilityMap = self.space.getVisibilityMap();
+
+    // Append missing pinned skeletons
+    var visibleSkids = options['pinnedSkeletons'] || [];
+
+    // Iterate over skeletons and create SVG views
+    var views = {};
+    for (var i=0, l=skeletons.length; i<l; ++i) {
+      var skid = skeletons[i];
+      // Display only current skeleton along with pinned ones
+      visibleSkids.push(skid);
+      self.space.setSkeletonVisibility(visibilityMap, visibleSkids);
+
+      // Render view and replace sphere meshes of current skeleton
+      var spheres = visibleSkids.reduce(function(o, s) {
+        o[s] = sphereMeshes[s];
+        return o;
+      }, {});
+      var svg = renderSkeletons(spheres);
+
+      if (displayNames) {
+        // Add name of neuron
+        var text = document.createElementNS(namespace, 'text');
+        text.setAttribute('x', svg.viewBox.baseVal.x + 5);
+        text.setAttribute('y', svg.viewBox.baseVal.y + fontsize + 5);
+        text.setAttribute('style', 'font-family: Arial; font-size: ' + fontsize + 'px;');
+        var name = NeuronNameService.getInstance().getName(skid);
+        text.appendChild(document.createTextNode(name));
+        svg.appendChild(text);
+      }
+
+      // Remove current skeleton again from visibility list
+      visibleSkids.pop();
+
+      // Store
+      views[skid] = svg;
+    }
+
+    // Restore visibility
+    self.space.setSkeletonVisibility(visibilityMap);
+
+    // Create result svg
+    var svg = document.createElement('svg');
+    svg.setAttribute('xmlns', namespace);
+    svg.setAttribute('width', 2 * margin + numColumns * (imageWidth + 2 * padding));
+    svg.setAttribute('height', 2 * margin + numRows * (imageHeight + 2 * padding));
+
+    // Title
+    var title = document.createElementNS(namespace, 'title');
+    title.appendChild(document.createTextNode(options['title'] || 'CATMAID neuron catalog'));
+    svg.appendChild(title);
+
+    // Combine all generated SVGs into one
+    for (var i=0, l=skeletons.length; i<l; ++i) {
+      var skid = skeletons[i];
+      var data = views[skid];
+
+      // Add a translation to current image
+      var col = i % numColumns;
+      var row = Math.floor(i / numColumns);
+      data.setAttribute('x', margin + col * imageWidth + (col * 2 + 1) * padding);
+      data.setAttribute('y', margin + row * imageHeight + (row * 2 * padding) + padding);
+
+      // Append the group to the SVG
+      svg.appendChild(data);
+    }
+
+    return svg;
+  }
+
+  /**
+   * Render the current scene and replace the given sphere meshes beforehand.
+   */
+  function renderSkeletons(sphereMeshes)
+  {
+    // Hide spherical meshes of all given skeletons
+    var sphereReplacemens = {};
+    for (var skid in sphereMeshes) {
+      setVisibility(sphereMeshes[skid], false);
+      sphereReplacemens[skid] = addSphereReplacements(sphereMeshes[skid], self.space);
+    }
+
+    // Create a new SVG renderer (which is faster than cleaning an existing one)
+    // and render the image
+    var svgRenderer = self.createRenderer('svg');
+    svgRenderer.clear();
+    svgRenderer.render(self.space.scene, self.camera);
+
+    // Show spherical meshes again and remove substitutes
+    for (skid in sphereMeshes) {
+      removeSphereReplacements(sphereReplacemens[skid], self.space);
+      setVisibility(sphereMeshes[skid], true);
+    }
+
+    return svgRenderer.domElement;
+  }
+};
 
 /**
  * Set camera position so that the whole XY side of the bounding box facing +Z
@@ -1457,13 +2377,45 @@ WebGLApplication.prototype.Space.prototype.View.prototype.ZX = function() {
 	this.camera.up.set(-1, 0, 0);
 };
 
+/**
+ * Get properties of current view.
+ */
+WebGLApplication.prototype.Space.prototype.View.prototype.getView = function() {
+  return {
+    target: this.controls.target.clone(),
+    position: this.camera.position.clone(),
+    up: this.camera.up.clone(),
+    zoom: this.camera.zoom,
+    orthographic: this.camera.inOrthographicMode,
+  };
+};
+
+/**
+ * Set properties of current view.
+ *
+ * @param {THREE.Vector3} target - the target of the camera
+ * @param {THREE.Vector3} position - the position of the camera
+ * @param {THREE.Vector3} up - up direction
+ */
+WebGLApplication.prototype.Space.prototype.View.prototype.setView = function(target, position, up, zoom, orthographic) {
+	this.controls.target.copy(target);
+	this.camera.position.copy(position);
+	this.camera.up.copy(up);
+	this.camera.zoom = zoom;
+	if(orthographic) {
+		this.camera.toOrthographic();
+	} else {
+		this.camera.toPerspective();
+	}
+};
+
 /** Construct mouse controls as objects, so that no context is retained. */
 WebGLApplication.prototype.Space.prototype.View.prototype.MouseControls = function() {
 
   this.attach = function(view, domElement) {
     domElement.CATMAID_view = view;
   
-    domElement.addEventListener('mousewheel', this.MouseWheel, false);
+    domElement.addEventListener('wheel', this.MouseWheel, false);
     domElement.addEventListener('mousemove', this.MouseMove, false);
     domElement.addEventListener('mouseup', this.MouseUp, false);
     domElement.addEventListener('mousedown', this.MouseDown, false);
@@ -1473,7 +2425,7 @@ WebGLApplication.prototype.Space.prototype.View.prototype.MouseControls = functi
     domElement.CATMAID_view = null;
     delete domElement.CATMAID_view;
 
-    domElement.removeEventListener('mousewheel', this.MouseWheel, false);
+    domElement.removeEventListener('wheel', this.MouseWheel, false);
     domElement.removeEventListener('mousemove', this.MouseMove, false);
     domElement.removeEventListener('mouseup', this.MouseUp, false);
     domElement.removeEventListener('mousedown', this.MouseDown, false);
@@ -1481,7 +2433,38 @@ WebGLApplication.prototype.Space.prototype.View.prototype.MouseControls = functi
     Object.keys(this).forEach(function(key) { delete this[key]; }, this);
   };
 
+  /**
+   * Modifies the zoom (and therefore the effective focal length) of the camera.
+   * If the Ctrl-key is pressed and the camera is not in orthographic mode, the
+   * camera (and target) is moved instead.
+   */
   this.MouseWheel = function(ev) {
+    var camera = this.CATMAID_view.camera;
+    if ((ev.ctrlKey || ev.altKey) && !camera.inOrthographicMode) {
+      // Move the camera and the target in target direction
+      var distance = 3500 * (ev.wheelDelta > 0 ? -1 : 1);
+      var controls = this.CATMAID_view.controls;
+      var change = new THREE.Vector3().copy(camera.position)
+        .sub(controls.target).normalize().multiplyScalar(distance);
+
+      camera.position.add(change);
+      // Move the target only if Alt was pressed
+      if (ev.altKey) {
+        controls.target.add(change);
+      }
+    } else {
+      // The distance to the target does not make any difference for an
+      // orthographic projection, the depth is fixed.
+      var new_zoom = camera.zoom;
+      if ((ev.deltaX + ev.deltaY) < 0) {
+        new_zoom += 0.25;
+      } else {
+        new_zoom -= 0.25;
+      }
+      new_zoom = Math.max(new_zoom, 1.0);
+      camera.setZoom( new_zoom );
+    }
+
     this.CATMAID_view.space.render();
   };
 
@@ -1495,7 +2478,12 @@ WebGLApplication.prototype.Space.prototype.View.prototype.MouseControls = functi
       space.render();
     }
 
-    space.container.style.cursor = 'pointer';
+    // Use a cross hair cursor if shift is pressed
+    if (ev.shiftKey) {
+      space.container.style.cursor = "url(" + STATIC_URL_JS + "images/svg-circle.cur) 15 15, crosshair";
+    } else {
+      space.container.style.cursor = 'pointer';
+    }
   };
 
   this.MouseUp = function(ev) {
@@ -1515,46 +2503,227 @@ WebGLApplication.prototype.Space.prototype.View.prototype.MouseControls = functi
     mouse.is_mouse_down = true;
 		if (!ev.shiftKey) return;
 
-		// Find object under the mouse
-		var vector = new THREE.Vector3(mouse.position.x, mouse.position.y, 0.5);
-		projector.unprojectVector(vector, camera);
-		var raycaster = new THREE.Raycaster(camera.position, vector.sub(camera.position).normalize());
-
-		// Attempt to intersect visible skeleton spheres, stopping at the first found
-		var fields = ['specialTagSpheres', 'synapticSpheres', 'radiusVolumes'];
-    var skeletons = space.content.skeletons;
-		if (Object.keys(skeletons).some(function(skeleton_id) {
-			var skeleton = skeletons[skeleton_id];
-			if (!skeleton.visible) return false;
-			var all_spheres = fields.map(function(field) { return skeleton[field]; })
-						                  .reduce(function(a, spheres) {
-                                return Object.keys(spheres).reduce(function(a, id) {
-                                  a.push(spheres[id]);
-                                  return a;
-                                }, a);
-                              }, []);
-			var intersects = raycaster.intersectObjects(all_spheres, true);
-			if (intersects.length > 0) {
-				return all_spheres.some(function(sphere) {
-					if (sphere.id !== intersects[0].object.id) return false;
-					SkeletonAnnotations.staticMoveToAndSelectNode(sphere.node_id);
-					return true;
-				});
-			}
-			return false;
-		})) {
-			return;
-		}
-
-		growlAlert("Oops", "Couldn't find any intersectable object under the mouse.");
+    // Try to pick the node by casting a ray
+    var nodeId = space.pickNodeWithIntersectionRay(mouse.position.x, mouse.position.y,
+        ev.offsetX, camera);
+    if (!nodeId) {
+      // If no node was found through ray casting, try to pick a node using a
+      // color map. This option is more precise, but also slower. It is
+      // therefore used as a second option.
+      nodeId = space.pickNodeWithColorMap(ev.offsetX, ev.offsetY, camera);
+    }
+    if (!nodeId) {
+      CATMAID.msg("Oops", "Couldn't find any intersectable object under the mouse.");
+    } else {
+      SkeletonAnnotations.staticMoveToAndSelectNode(nodeId);
+    }
   };
 };
 
+/**
+ * Tries to pick an element by creating a color map.
+ *
+ * @param x First mouse position component, relativ to WebGL canvas
+ * @param y First mouse position component, relativ to WebGL canvas
+ * @param camera The camera the picking map should be created with
+ * @param savePickingMap Export the picking color map as PNG image
+ * @return the picked node's ID or null if no node was found
+ */
+WebGLApplication.prototype.Space.prototype.pickNodeWithColorMap = function(x, y, camera, savePickingMap) {
+  // Attempt to intersect visible skeleton spheres, stopping at the first found
+  var color = 0;
+  var idMap = {};
+  var submit = new submitterFn();
+  var originalMaterials = {};
+  var originalVisibility = {};
+  var originalConnectorPreVisibility =
+    this.staticContent.connectorLineColors.presynaptic_to.visible;
+  var originalConnectorPostVisibility =
+    this.staticContent.connectorLineColors.postsynaptic_to.visible;
 
-WebGLApplication.prototype.Space.prototype.Content.prototype.ActiveNode = function() {
+  // Hide everthing unpickable
+  var o = CATMAID.tools.deepCopy(this.options);
+  o.show_meshes = false;
+  o.show_missing_sections = false;
+  o.show_active_node = false;
+  o.show_floor = false;
+  o.show_background = false;
+  o.show_box = false;
+  o.show_zplane = false;
+  this.staticContent.adjust(o, this);
+  this.content.adjust(o, this, submit);
+  // Hide pre and post synaptic flags
+  this.staticContent.connectorLineColors.presynaptic_to.visible = false;
+  this.staticContent.connectorLineColors.postsynaptic_to.visible = false;
+
+  // Prepare all spheres for picking by coloring them with an ID.
+  mapToPickables(this.content.skeletons, function(skeleton) {
+    originalVisibility[skeleton.id] = skeleton.actor.neurite.visible;
+    skeleton.actor.neurite.visible = false;
+  }, function(id, obj) {
+    // IDs are expected to be 64 (bigint in Postgres) and can't be mapped to
+    // colors directly. Since the space we are looking here at is likely to be
+    // smaller, we can map colors to IDs ourself.
+    color++;
+    idMap[color] = id;
+    originalMaterials[id] = obj.material;
+    obj.material = new THREE.MeshBasicMaterial({color: color});
+  });
+
+  // Render scene to picking texture
+  var gl = this.view.renderer.getContext();
+  this.view.renderer.render(this.scene, camera, this.pickingTexture);
+  var pixelBuffer = new Uint8Array(4);
+
+  // Read pixel under cursor
+  gl.readPixels(x, this.pickingTexture.height - y, 1, 1, gl.RGBA,
+      gl.UNSIGNED_BYTE, pixelBuffer);
+
+  // Reset materials
+  mapToPickables(this.content.skeletons, function(skeleton) {
+    skeleton.actor.neurite.visible = originalVisibility[skeleton.id];
+  }, function(id, obj) {
+    obj.material = originalMaterials[id];
+  });
+
+  // Reset visibility of unpickable things
+  this.staticContent.adjust(this.options, this);
+  this.content.adjust(this.options, this, submit);
+  // Restore original pre and post synaptic visibility
+  this.staticContent.connectorLineColors.presynaptic_to.visible =
+    originalConnectorPreVisibility;
+  this.staticContent.connectorLineColors.postsynaptic_to.visible =
+    originalConnectorPostVisibility;
+
+  var colorId = (pixelBuffer[0] << 16) | (pixelBuffer[1] << 8) | (pixelBuffer[2]);
+
+  // If wanted, the picking map can be exported
+  if (savePickingMap) {
+    var img = CATMAID.tools.createImageFromGlContext(gl,
+        this.pickingTexture.width, this.pickingTexture.height);
+    var blob = CATMAID.tools.dataURItoBlob(img.src);
+    saveAs(blob, "pickingmap.png");
+  }
+
+  if (0 === colorId || !idMap[colorId]) {
+    return null;
+  }
+
+  return idMap[colorId];
+
+  /**
+   * Execute a function for every skeleton and one for each of its pickable
+   * elements (defined in fields.
+   */
+  function mapToPickables(skeletons, fnSkeleton, fnPickable) {
+    var fields = ['specialTagSpheres', 'synapticSpheres', 'radiusVolumes'];
+    Object.keys(skeletons).forEach(function(skeleton_id) {
+      var skeleton = skeletons[skeleton_id];
+      fnSkeleton(skeleton);
+      fields.map(function(field) {
+        return skeleton[field];
+      }).forEach(function(spheres) {
+        Object.keys(spheres).forEach(function(id) {
+          fnPickable(id, spheres[id]);
+        });
+      });
+    });
+  }
+};
+
+WebGLApplication.prototype.Space.prototype.pickNodeWithIntersectionRay = function(x, y, xOffset, camera) {
+  // Attempt to intersect visible skeleton spheres, stopping at the first found
+  var fields = ['specialTagSpheres', 'synapticSpheres', 'radiusVolumes'];
+  var skeletons = this.content.skeletons;
+
+  // Step, which is normalized screen coordinates, is choosen so that it will
+  // span half a pixel width in screen space.
+  var adjPxNSC = ((xOffset + 1) / this.canvasWidth) * 2 - 1;
+  var step = 0.5 * Math.abs(x - adjPxNSC);
+  var increments = 1;
+
+  // Setup ray caster
+  var raycaster = new THREE.Raycaster();
+  var setupRay = (function(raycaster, camera) {
+    if (camera.inPerspectiveMode) {
+      raycaster.ray.origin.copy(camera.position);
+      //raycaster.ray.origin.set(0, 0, 0).unproject(camera);
+      return function(x,y) {
+        raycaster.ray.direction.set(x, y, 0.5).unproject(camera).sub(camera.position).normalize();
+      };
+    } else {
+      raycaster.ray.direction.set(0, 0, -1).transformDirection(camera.matrixWorld);
+      return function(x, y) {
+        raycaster.ray.origin.set(x, y, -1 ).unproject(camera);
+      };
+    }
+  })(raycaster, camera);
+
+  // Iterate over all skeletons and find the ones that are intersected
+  var nodeId = null;
+  var intersectionFound = Object.keys(skeletons).some(function(skeleton_id) {
+    var skeleton = skeletons[skeleton_id];
+    if (!skeleton.visible) return false;
+    var all_spheres = fields.map(function(field) { return skeleton[field]; })
+                            .reduce(function(a, spheres) {
+                              return Object.keys(spheres).reduce(function(a, id) {
+                                a.push(spheres[id]);
+                                return a;
+                              }, a);
+                            }, []);
+    nodeId = intersect(all_spheres, x, y, step, increments, raycaster, setupRay);
+    return nodeId !== null;
+  });
+
+  return nodeId;
+
+  /**
+   * Returns if a ray shot through X/Y (in normalized screen coordinates
+   * [-1,1]) inersects at least one of the intersectable spheres. If no
+   * intersection is found for the click position, concentric circles are
+   * created and rays are shoot along it. These circles are enlarged in every
+   * iteration by <step> until a maximum of <increment> circles was tested or
+   * an intersection was found. Every two circles, the radius is enlarged by
+   * one screen space pixel.
+   */
+  function intersect(objects, x, y, step, increments, raycaster, setupRay)
+  {
+    var found = false;
+    var nodeId = null;
+    for (var i=0; i<=increments; ++i) {
+      var numRays = i ? 4 * i : 1;
+      var a = 2 * Math.PI / numRays;
+      for (var j=0; j<numRays; ++j) {
+        setupRay(x + i * step * Math.cos(j * a),
+                 y + i * step * Math.sin(j * a));
+
+        // Test intersection
+        var intersects = raycaster.intersectObjects(objects);
+        if (intersects.length > 0) {
+          found = objects.some(function(sphere) {
+            if (sphere.id !== intersects[0].object.id) return false;
+            nodeId = sphere.node_id;
+            return true;
+          });
+        }
+
+        if (found) {
+          break;
+        }
+      }
+      if (found) {
+        break;
+      }
+    }
+
+    return nodeId;
+  }
+};
+
+WebGLApplication.prototype.Space.prototype.Content.prototype.ActiveNode = function(options) {
   this.skeleton_id = null;
-  this.mesh = new THREE.Mesh( new THREE.IcosahedronGeometry(1, 2), new THREE.MeshBasicMaterial( { color: 0x00ff00, opacity:0.8, transparent:true } ) );
-  this.mesh.scale.x = this.mesh.scale.y = this.mesh.scale.z = 160;
+  this.mesh = new THREE.Mesh( new THREE.IcosahedronGeometry(40, 2), new THREE.MeshBasicMaterial( { color: 0x00ff00, opacity:0.8, transparent:true } ) );
+  CATMAID.tools.setXYZ(this.mesh.scale, options.skeleton_node_scaling);
 };
 
 WebGLApplication.prototype.Space.prototype.Content.prototype.ActiveNode.prototype = {};
@@ -1564,7 +2733,7 @@ WebGLApplication.prototype.Space.prototype.Content.prototype.ActiveNode.prototyp
 };
 
 WebGLApplication.prototype.Space.prototype.Content.prototype.ActiveNode.prototype.updatePosition = function(space, options) {
-  var pos = SkeletonAnnotations.getActiveNodePosition();
+  var pos = SkeletonAnnotations.getActiveNodePositionW();
   if (!pos) {
     space.updateSplitShading(this.skeleton_id, null, options);
     this.skeleton_id = null;
@@ -1612,11 +2781,11 @@ WebGLApplication.prototype.Space.prototype.Skeleton = function(space, skeletonmo
   this.synapticColors = space.staticContent.synapticColors;
   this.skeletonmodel = skeletonmodel;
   this.opacity = skeletonmodel.opacity;
-  // This is an index mapping treenode IDs to lists of reviewers. Attaching them
-  // directly to the nodes is too much of a performance hit.
+  // This is an index mapping treenode IDs to lists of [reviewer_id, review_time].
+  // Attaching them directly to the nodes is too much of a performance hit.
   // Gets loaded dynamically, and erased when refreshing (because a new Skeleton is instantiated with the same model).
   this.reviews = null;
-  // A map of nodeID vs true for nodes that belong to the axon, as computed by splitByFlowCentrality. Loaded dynamically, and erased when refreshing like this.reviews.
+  // The arbor of the axon, as computed by splitByFlowCentrality. Loaded dynamically, and erased when refreshing like this.reviews.
   this.axon = null;
 };
 
@@ -1651,7 +2820,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.initialize_objects
 	this.textlabels = {};
 
   // Used only with restricted connectors
-	this.connectoractor = {};
+	this.connectoractor = null;
 	this.connectorgeometry = {};
 };
 
@@ -1719,6 +2888,14 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setSynapticVisibil
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setPreVisibility = WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setSynapticVisibilityFn('presynaptic_to');
 
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setPostVisibility = WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setSynapticVisibilityFn('postsynaptic_to');
+
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.setMetaVisibility = function(vis) {
+  for (var idx in this.specialTagSpheres) {
+    if (this.specialTagSpheres.hasOwnProperty(idx)) {
+      this.specialTagSpheres[idx].visible = vis;
+    }
+  }
+};
 
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createTextMeshes = function() {
 	// Sort out tags by node: some nodes may have more than one
@@ -1815,15 +2992,6 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.translate = functi
 };
 */
 
-WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createSynapseClustering = function(bandwidth) {
-  var locations = this.geometry['neurite'].vertices.reduce(function(vs, v) {
-    vs[v.node_id] = v.clone();
-    return vs;
-  }, {});
-  
-  return new SynapseClustering(this.createArbor(), locations, this.createSynapseCounts(), bandwidth);
-};
-
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createSynapseCounts = function() {
   return this.synapticTypes.reduce((function(o, type, k) {
     var vs = this.geometry[type].vertices;
@@ -1895,13 +3063,40 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createInverseSynap
   }).bind(this), {});
 };
 
+/** For skeletons with a single node will return an Arbor without edges and with a null root,
+ * given that it has no edges, and therefore no vertices, at all. */
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createArbor = function() {
   return new Arbor().addEdges(this.geometry['neurite'].vertices,
                               function(v) { return v.node_id; });
 };
 
+/** Second argument 'arbor' is optional. */
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createUpstreamArbor = function(tag_regex, arbor) {
+  var tags = this.tags,
+      regex = new RegExp(tag_regex),
+      cuts = Object.keys(tags).filter(function(tag) {
+    return tag.match(regex);
+  }).reduce(function(o, tag) {
+    return tags[tag].reduce(function(o, nodeID) { o[nodeID] = true; return o;}, o);
+  }, {});
+  arbor = arbor ? arbor : this.createArbor();
+  return arbor.upstreamArbor(cuts);
+};
+
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.getPositions = function() {
-  return this.geometry['neurite'].vertices.reduce(function(o, v) { o[v.node_id] = v; return o; }, {});
+  var vs = this.geometry['neurite'].vertices,
+      p = {};
+  for (var i=0; i<vs.length; ++i) {
+    var v = vs[i];
+    p[v.node_id] = v;
+  }
+  return p;
+};
+
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createNodeDistanceFn = function() {
+ return (function(child, paren) {
+   return this[child].distanceTo(this[paren]);
+ }).bind(this.getPositions());
 };
 
 /** Determine the nodes that belong to the axon by computing the centrifugal flow
@@ -1918,12 +3113,11 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.splitByFlowCentral
       if (arbor.root != soma) arbor.reroot(soma);
     }
 
-    var ap = new ArborParser();
+    var ap = new CATMAID.ArborParser();
     ap.arbor = arbor;
     ap.synapses(json[1]);
 
-    var axon = SynapseClustering.prototype.findAxon(ap, 0.9);
-    return axon ? axon.nodes() : null;
+    return SynapseClustering.prototype.findAxon(ap, 0.9, this.getPositions());
 };
 
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColor = function(options) {
@@ -1946,7 +3140,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
         // Flow centrality
         var io = this.createPrePostCounts();
         if (0 === io.postsynaptic_to_count || 0 === io.presynaptic_to_count) {
-          growlAlert('WARNING', 'Neuron "' + this.skeletonmodel.baseName + '" lacks input or output synapses.');
+          CATMAID.warn('Neuron "' + this.skeletonmodel.baseName + '" lacks input or output synapses.');
           c = arbor.nodesArray().reduce(function(o, node) {
             // All the same
             o[node] = 1;
@@ -1982,16 +3176,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
       node_weights = c;
 
     } else if ('distance_to_root' === options.shading_method) {
-      var locations = this.geometry['neurite'].vertices.reduce(function(vs, v) {
-        vs[v.node_id] = v;
-        return vs;
-      }, {});
-
-      var distanceFn = (function(child, paren) {
-        return this[child].distanceTo(this[paren]);
-      }).bind(locations);
-
-      var dr = arbor.nodesDistanceTo(arbor.root, distanceFn),
+      var dr = arbor.nodesDistanceTo(arbor.root, this.createNodeDistanceFn()),
           distances = dr.distances,
           max = dr.max;
 
@@ -2003,19 +3188,16 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
       node_weights = distances;
 
     } else if ('downstream_amount' === options.shading_method) {
-      var locations = this.geometry['neurite'].vertices.reduce(function(vs, v) {
-        vs[v.node_id] = v;
-        return vs;
-      }, {});
-
-      var distanceFn = (function(paren, child) {
-        return this[child].distanceTo(this[paren]);
-      }).bind(locations);
-
-      node_weights = arbor.downstreamAmount(distanceFn, true);
+      node_weights = arbor.downstreamAmount(this.createNodeDistanceFn(), true);
 
     } else if ('active_node_split' === options.shading_method) {
+      // The active node is not necessarily a real node and splitting the arbor
+      // will therefore not work in case of a virtual node. The split is
+      // therefore performed with the next real child node and the node weight
+      // of the child will be adjusted to get the same visual effect.
       var atn = SkeletonAnnotations.getActiveNodeId();
+      var virtualAtn = !SkeletonAnnotations.isRealNode(atn);
+      if (virtualAtn) atn = SkeletonAnnotations.getChildOfVirtualNode(atn);
       if (arbor.contains(atn)) {
         node_weights = {};
         var sub = arbor.subArbor(atn),
@@ -2028,6 +3210,19 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
         arbor.nodesArray().forEach(function(node) {
           node_weights[node] = sub.contains(node) ? down : up;
         });
+        if (virtualAtn) {
+          // If the active node is virtual, the weight of its real child is
+          // adjusted so so that it matches the visual appearance of having an
+          // actual node at the ATNs location.
+          var vnPos = this.space.toSpace(SkeletonAnnotations.getActiveNodePositionW());
+          vnPos = new THREE.Vector3(vnPos.x, vnPos.y, vnPos.z);
+          var locations = this.getPositions();
+          var vn = SkeletonAnnotations.getActiveNodeId();
+          var parentPos = locations[SkeletonAnnotations.getParentOfVirtualNode(vn)];
+          var childPos = locations[SkeletonAnnotations.getChildOfVirtualNode(vn)];
+          var distRatio = parentPos.distanceToSquared(vnPos) / parentPos.distanceToSquared(childPos);
+          node_weights[atn] = up - distRatio * (up - down);
+        }
       } else {
         // Don't shade any
         node_weights = {};
@@ -2035,10 +3230,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
 
     } else if ('partitions' === options.shading_method) {
       // Shade by euclidian length, relative to the longest branch
-      var locations = this.geometry['neurite'].vertices.reduce(function(vs, v) {
-        vs[v.node_id] = v;
-        return vs;
-      }, {});
+      var locations = this.getPositions();
       var partitions = arbor.partitionSorted();
       node_weights = partitions.reduce(function(o, seq, i) {
         var loc1 = locations[seq[0]],
@@ -2066,14 +3258,83 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
       Object.keys(node_weights).forEach(function(node) {
         node_weights[node] /= max;
       });
+    } else if ('near_active_node' === options.shading_method) {
+      var active = SkeletonAnnotations.getActiveNodeId();
+      if (!active || !arbor.contains(active)) node_weights = null;
+      else {
+        var within = arbor.findNodesWithin(active, this.createNodeDistanceFn(), options.distance_to_active_node);
+        node_weights = {};
+        arbor.nodesArray().forEach(function(node) {
+          node_weights[node] = undefined === within[node] ? 0 : 1;
+        });
+      }
+    } else if ('synapse-free' === options.shading_method) {
+      var locations = this.getPositions(),
+          node_weights = {};
+      arbor.split(this.createSynapseCounts()).forEach(function(fragment) {
+        var weight = 0;
+        if (fragment.cableLength(locations) >= options.min_synapse_free_cable) {
+          weight = 1;
+        }
+        fragment.nodesArray().forEach(function(node) {
+          this[node] = weight;
+        }, node_weights);
+      });
+    } else if ('dendritic-backbone' === options.shading_method) {
+      node_weights = {};
+      if (!this.axon) {
+        // Not computable
+        console.log("Shading '" + options.shading_method + "' not computable for skeleton ID #" + this.id + ", neuron named: " + NeuronNameService.getInstance().getName(this.id) + ". The axon is missing.");
+      } else {
+        // Prune artifactual branches
+        if (this.tags['not a branch']) {
+          var ap = new CATMAID.ArborParser(); ap.inputs = {}; ap.outputs = {};
+          ap.arbor = arbor.clone();
+          ap.collapseArtifactualBranches(this.tags);
+          arbor = ap.arbor;
+        }
+        // Create backbone arbor
+        var upstream;
+        if (this.tags['microtubules end'] && this.tags['microtubules end'].length > 0) {
+          upstream = this.createUpstreamArbor('microtubules end', arbor);
+        } else {
+          var cuts = arbor.approximateTwigRoots(options.strahler_cut);
+          if (cuts && cuts.length > 0) {
+            upstream = arbor.upstreamArbor(cuts);
+            CATMAID.msg("Approximating dendritic backbone", "By strahler number " + options.strahler_cut + ", neuron: " + NeuronNameService.getInstance().getName(this.id));
+          }
+        }
+        node_weights = {};
+        if (upstream) {
+          // Collect nodes that don't belong to the dendritic backbone
+          var outside = {},
+              add = (function(node) { this[node] = true; }).bind(outside);
+          // Nodes from the axon terminals
+          this.axon.nodesArray().forEach(add);
+          // Nodes from the linker between dendritic tree and axon terminals
+          this.axon.fc_max_plateau.forEach(add);
+          // Nodes primarily from the linker between arbor and soma
+          this.axon.fc_zeros.forEach(add);
+          // Set weights
+          arbor.nodesArray().forEach(function(node) {
+            this[node] = (upstream.contains(node) && !outside[node]) ? 1 : 0;
+          }, node_weights);
+        }
+      }
+    } else if ('downstream-of-tag' === options.shading_method) {
+      node_weights = {};
+      var upstream = this.createUpstreamArbor(options.tag_regex, arbor);
+      arbor.nodesArray().forEach(function(node) {
+        this[node] = upstream.contains(node) ? 0 : 1;
+      }, node_weights);
     }
   }
 
   if (options.invert_shading && node_weights) {
     // All weights are values between 0 and 1
     Object.keys(node_weights).forEach(function(node) {
-      node_weights[node] = 1 - node_weights[node];
-    });
+      this[node] = 1 - this[node];
+    }, node_weights);
   }
 
   if (node_weights || 'none' !== options.color_method) {
@@ -2098,33 +3359,30 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
             reviewedColor : unreviewedColor;
         }).bind(this)
         : function() { return notComputable; };
+    } else if ('whitelist-reviewed' === options.color_method) {
+      pickColor = this.reviews ?
+        (function(vertex) {
+          var wl = CATMAID.ReviewSystem.Whitelist.getWhitelist();
+          var reviewers = this.reviews[vertex.node_id];
+        return reviewers && reviewers.some(function (r) {
+            return r[0] in wl && (new Date(r[1])) > wl[r[0]];}) ?
+          reviewedColor : unreviewedColor;
+      }).bind(this)
+        : function() { return notComputable; };
     } else if ('own-reviewed' === options.color_method) {
       pickColor = this.reviews ?
         (function(vertex) {
           var reviewers = this.reviews[vertex.node_id];
-        return reviewers && -1 !== reviewers.indexOf(session.userid) ?
+        return reviewers && reviewers.some(function (r) { return r[0] == session.userid;}) ?
           reviewedColor : unreviewedColor;
       }).bind(this)
         : function() { return notComputable; };
     } else if ('axon-and-dendrite' === options.color_method) {
       pickColor = this.axon ?
         (function(vertex) {
-        return this.axon[vertex.node_id] ? axonColor : dendriteColor;
-      }).bind(this)
+        return this.contains(vertex.node_id) ? axonColor : dendriteColor;
+      }).bind(this.axon)
         : function() { return notComputable; };
-    } else if ('downstream-of-tag' === options.color_method) {
-      var tags = this.tags,
-          regex = new RegExp(options.tag_regex),
-          cuts = Object.keys(tags).filter(function(tag) {
-        return tag.match(regex);
-      }).reduce(function(o, tag) {
-        return tags[tag].reduce(function(o, nodeID) { o[nodeID] = true; return o;}, o);
-      }, {});
-      if (!arbor) arbor = this.createArbor();
-      var upstream = arbor.upstreamArbor(cuts);
-      pickColor = function(vertex) {
-        return upstream.contains(vertex.node_id) ? unreviewedColor : actorColor;
-      };
     } else {
       pickColor = function() { return actorColor; };
     }
@@ -2153,7 +3411,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
       if (mesh) {
         var material = mesh.material.clone();
         material.color = color;
-        mesh.setMaterial(material);
+        mesh.material = material;
       }
 
       return color;
@@ -2161,8 +3419,15 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
 
     this.geometry['neurite'].colorsNeedUpdate = true;
     this.actor['neurite'].material.color = new THREE.Color().setHex(0xffffff);
-    this.actor['neurite'].material.opacity = 1;
-    this.actor['neurite'].material.transparent = false;
+
+    if ('none' === options.color_method) {
+      this.actor['neurite'].material.opacity = this.opacity;
+      this.actor['neurite'].material.transparent = this.opacity !== 1;
+    } else {
+      this.actor['neurite'].material.opacity = 1;
+      this.actor['neurite'].material.transparent = false;
+    }
+
     this.actor['neurite'].material.needsUpdate = true; // TODO repeated, it's the line_material
 
   } else {
@@ -2176,11 +3441,11 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.updateSkeletonColo
     this.actor['neurite'].material.transparent = this.opacity !== 1;
     this.actor['neurite'].material.needsUpdate = true; // TODO repeated it's the line_material
 
-    var material = new THREE.MeshBasicMaterial({color: this.actorColor, opacity:1.0, transparent:false});
+    var material = new THREE.MeshBasicMaterial({color: this.actorColor, opacity: this.opacity, transparent: this.opacity !== 1});
 
     for (var k in this.radiusVolumes) {
       if (this.radiusVolumes.hasOwnProperty(k)) {
-        this.radiusVolumes[k].setMaterial(material);
+        this.radiusVolumes[k].material = material;
       }
     }
   }
@@ -2191,12 +3456,45 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.changeSkeletonLine
     this.actor['neurite'].material.needsUpdate = true;
 };
 
+/**
+ * Scale node handles of a skeletons. These are the special tag spheres and the
+ * synaptic spheres.
+ */
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.scaleNodeHandles = function(value) {
+    // Scale special tag spheres
+    for (var k in this.specialTagSpheres) {
+      if (this.specialTagSpheres.hasOwnProperty(k)) {
+        CATMAID.tools.setXYZ(this.specialTagSpheres[k].scale, value);
+      }
+    }
+
+    // Scale synaptic spheres
+    for (var k in this.synapticSpheres) {
+      if (this.synapticSpheres.hasOwnProperty(k)) {
+        CATMAID.tools.setXYZ(this.synapticSpheres[k].scale, value);
+      }
+    }
+};
+
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.changeColor = function(color, options) {
 	this.actorColor = color;
 	if (options.color_method === 'manual') {
 		this.updateSkeletonColor(options);
 	}
 };
+
+WebGLApplication.prototype.updateCameraView = function(toOrthographic) {
+  if(toOrthographic) {
+    this.options.camera_view = 'orthographic';
+    this.space.view.camera.toOrthographic();
+  } else {
+    this.options.camera_view = 'perspective';
+    this.space.view.camera.setZoom(1.0);
+    this.space.view.camera.toPerspective();
+  }
+  this.space.render();
+};
+
 
 WebGLApplication.prototype.updateConnectorColors = function(select) {
   this.options.connector_color = select.value;
@@ -2206,8 +3504,37 @@ WebGLApplication.prototype.updateConnectorColors = function(select) {
   this.space.updateConnectorColors(this.options, skeletons, this.space.render.bind(this.space));
 };
 
+/**
+ * If restriced connector geometry is in use, update their material and color
+ * with the color of regular connectors. Only a reference is used.
+ */
+WebGLApplication.prototype.Space.prototype.updateRestrictedConnectorColors = function(skeletons) {
+  for (var i=0; i < skeletons.length; ++i) {
+    var s = skeletons[i];
+    // If there is restricted connector geometry displayed, update it, too
+    if (s.connectoractor) {
+      s.synapticTypes.forEach(function(type) {
+        // A reference is fine, the connectoractor material and geometry color
+        // aren't modified directly.
+        this.connectoractor[type].material = this.actor[type].material;
+        this.connectoractor[type].material.needsUpdate = true;
+        this.connectorgeometry[type].colors = this.geometry[type].colors;
+        this.connectorgeometry[type].colorsNeedUpdate = true;
+      }, s);
+    }
+  }
+};
+
 WebGLApplication.prototype.Space.prototype.updateConnectorColors = function(options, skeletons, callback) {
-  if ('cyan-red' === options.connector_color) {
+  // Make all
+  var self = this;
+  var done = function() {
+    self.updateRestrictedConnectorColors(skeletons);
+    if (CATMAID.tools.isFn(callback)) callback();
+  };
+
+   if ('cyan-red' === options.connector_color ||
+      'cyan-red-dark' === options.connector_color) {
     var pre = this.staticContent.synapticColors[0],
         post = this.staticContent.synapticColors[1];
 
@@ -2215,7 +3542,8 @@ WebGLApplication.prototype.Space.prototype.updateConnectorColors = function(opti
     pre.vertexColors = THREE.NoColors;
     pre.needsUpdate = true;
 
-    post.color.setRGB(0, 1, 1); // cyan
+    if ('cyan-red' === options.connector_color) post.color.setRGB(0, 1, 1); // cyan
+    else post.color.setHex(0x00b7eb); // dark cyan
     post.vertexColors = THREE.NoColors;
     post.needsUpdate = true;
 
@@ -2223,7 +3551,7 @@ WebGLApplication.prototype.Space.prototype.updateConnectorColors = function(opti
       skeleton.completeUpdateConnectorColor(options);
     });
 
-    if (callback) callback();
+    done();
 
   } else if ('by-amount' === options.connector_color) {
 
@@ -2244,44 +3572,40 @@ WebGLApplication.prototype.Space.prototype.updateConnectorColors = function(opti
               skeleton.completeUpdateConnectorColor(options, json[skeleton.id]);
             });
 
-            if (callback) callback();
+            done();
           } catch (e) {
             console.log(e, e.stack);
             alert(e);
           }
           $.unblockUI();
         }).bind(this));
-  } else if ('synapse-clustering' === options.connector_color) {
-
-    if (skeletons.length > 1) $.blockUI();
-
-    try {
-
-      skeletons.forEach(function(skeleton) {
-        skeleton.completeUpdateConnectorColor(options);
-      });
-
-      if (callback) callback();
-    } catch (e) {
-      console.log(e, e.stack);
-      alert(e);
-    }
-
-    $.unblockUI();
-  } else if ('axon-and-dendrite' === options.connector_color) {
+  } else if ('axon-and-dendrite' === options.connector_color || 'synapse-clustering' === options.connector_color) {
     fetchSkeletons(
         skeletons.map(function(skeleton) { return skeleton.id; }),
         function(skid) { return django_url + project.id + '/' + skid + '/0/1/0/compact-arbor'; },
         function(skid) { return {}; },
         (function(skid, json) { this.content.skeletons[skid].completeUpdateConnectorColor(options, json); }).bind(this),
-        function(skid) { growlAlert("Error", "Failed to load synapses for: " + skid); },
-        (function() { this.render(); }).bind(this));
+        function(skid) { CATMAID.msg("Error", "Failed to load synapses for: " + skid); },
+        (function() {
+          done();
+          this.render();
+        }).bind(this));
+  } else if ('skeleton' === options.connector_color) {
+    skeletons.forEach(function(skeleton) {
+      var fnConnectorValue = function() { return 0; },
+          fnMakeColor = function() { return skeleton.skeletonmodel.color.clone(); };
+      skeleton.synapticTypes.forEach(function(type) {
+        skeleton._colorConnectorsBy(type, fnConnectorValue, fnMakeColor);
+      });
+    });
+    done();
   }
 };
 
 /** Operates in conjunction with updateConnectorColors above. */
 WebGLApplication.prototype.Space.prototype.Skeleton.prototype.completeUpdateConnectorColor = function(options, json) {
-  if ('cyan-red' === options.connector_color) {
+  if ('cyan-red' === options.connector_color ||
+      'cyan-red-dark' === options.connector_color) {
     this.CTYPES.slice(1).forEach(function(type, i) {
       this.geometry[type].colors = [];
       this.geometry[type].colorsNeedUpdate = true;
@@ -2333,13 +3657,12 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.completeUpdateConn
     }, this);
 
   } else if ('synapse-clustering' === options.connector_color) {
-    var sc = this.createSynapseClustering(options.synapse_clustering_bandwidth),
+    var synapse_map = new CATMAID.ArborParser().synapses(json[1]).createSynapseMap(),
+        sc = new SynapseClustering(this.createArbor(), this.getPositions(), synapse_map, options.synapse_clustering_bandwidth),
         density_hill_map = sc.densityHillMap(),
         clusters = sc.clusterMaps(density_hill_map),
         colorizer = d3.scale.category10(),
         synapse_treenodes = Object.keys(sc.synapses);
-    // Remove bogus cluster - TODO fix this bogus cluster in SynapseClustering
-    delete clusters[undefined];
     // Filter out clusters without synapses
     var clusterIDs = Object.keys(clusters).filter(function(id) {
       var treenodes = clusters[id];
@@ -2373,14 +3696,14 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.completeUpdateConn
     }, this);
 
   } else if ('axon-and-dendrite' === options.connector_color) {
-    var axon = this.splitByFlowCentrality(json),
+    var axon = this.axon ? this.axon : null,
         fnMakeColor,
         fnConnectorValue;
 
     if (axon) {
       var colors = [new THREE.Color().setRGB(0, 1, 0),  // axon: green
                     new THREE.Color().setRGB(0, 0, 1)]; // dendrite: blue
-      fnConnectorValue = function(node_id, connector_id) { return axon[node_id] ? 0 : 1; };
+      fnConnectorValue = function(node_id, connector_id) { return axon.contains(node_id) ? 0 : 1; };
       fnMakeColor = function(value) { return colors[value]; };
     } else {
       // Not computable
@@ -2427,7 +3750,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype._colorConnectorsBy
         material.color = color;
         seen_materials[value] = material;
       }
-      mesh.setMaterial(material);
+      mesh.material = material;
     }
   }
 
@@ -2489,13 +3812,16 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.create_connector_s
         vertices2.push(v);
       }
     }
-		this.connectoractor[type] = new THREE.Line( this.connectorgeometry[type], this.space.staticContent.connectorLineColors[type], THREE.LinePieces );
-		this.space.add( this.connectoractor[type] );
+    this.connectoractor[type] = new THREE.Line( this.connectorgeometry[type],
+        this.actor[type].material, THREE.LinePieces );
+    this.connectorgeometry[type].colors = this.geometry[type].colors;
+    this.connectorgeometry[type].colorsNeedUpdate = true;
+    this.space.add( this.connectoractor[type] );
   }, this);
 };
 
 /** Place a colored sphere at the node. Used for highlighting special tags like 'uncertain end' and 'todo'. */
-WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createLabelSphere = function(v, material) {
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createLabelSphere = function(v, material, scaling) {
   if (this.specialTagSpheres.hasOwnProperty(v.node_id)) {
     // There already is a tag sphere at the node
     return;
@@ -2503,6 +3829,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createLabelSphere 
 	var mesh = new THREE.Mesh( this.space.staticContent.labelspheregeometry, material );
 	mesh.position.set( v.x, v.y, v.z );
 	mesh.node_id = v.node_id;
+	CATMAID.tools.setXYZ(mesh.scale, scaling);
 	this.specialTagSpheres[v.node_id] = mesh;
 	this.space.add( mesh );
 };
@@ -2546,8 +3873,8 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createCylinder = f
 	mesh.scale.z = radius;
 
 	var arrow = new THREE.ArrowHelper(direction.clone().normalize(), v1);
-	mesh.rotation = new THREE.Vector3().setEulerFromQuaternion(arrow.quaternion);
-	mesh.position = new THREE.Vector3().addVectors(v1, direction.multiplyScalar(0.5));
+	mesh.quaternion.copy(arrow.quaternion);
+	mesh.position.addVectors(v1, direction.multiplyScalar(0.5));
 
 	mesh.node_id = v1.node_id;
 
@@ -2556,7 +3883,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createCylinder = f
 };
 
 /* The itype is 0 (pre) or 1 (post), and chooses from the two arrays: synapticTypes and synapticColors. */
-WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createSynapticSphere = function(v, itype) {
+WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createSynapticSphere = function(v, itype, scaling) {
   if (this.synapticSpheres.hasOwnProperty(v.node_id)) {
     // There already is a synaptic sphere at the node
     return;
@@ -2565,6 +3892,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.createSynapticSphe
 	mesh.position.set( v.x, v.y, v.z );
 	mesh.node_id = v.node_id;
 	mesh.type = this.synapticTypes[itype];
+	CATMAID.tools.setXYZ(mesh.scale, scaling);
 	this.synapticSpheres[v.node_id] = mesh;
 	this.space.add( mesh );
 };
@@ -2613,7 +3941,6 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
 		// If node has a parent
     var v1;
 		if (node[1]) {
-			var p = nodeProps[node[1]];
       v1 = vs[node[0]];
       if (!v1) {
 			  v1 = this.space.toSpace(new THREE.Vector3(node[3], node[4], node[5]));
@@ -2621,6 +3948,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
         v1.user_id = node[2];
         vs[node[0]] = v1;
       }
+      var p = nodeProps[node[1]];
       var v2 = vs[p[0]];
       if (!v2) {
 			  v2 = this.space.toSpace(new THREE.Vector3(p[3], p[4], p[5]));
@@ -2663,15 +3991,23 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
 		}
 		if (!lean && node[7] < 5) {
 			// Edge with confidence lower than 5
-			this.createLabelSphere(v1, this.space.staticContent.labelColors.uncertain);
+			this.createLabelSphere(v1, this.space.staticContent.labelColors.uncertain, options.skeleton_node_scaling);
 		}
 	}, this);
 
   if (options.smooth_skeletons) {
-    var smoothed = this.createArbor().smoothPositions(vs, options.smooth_skeletons_sigma);
-    Object.keys(vs).forEach(function(node_id) {
-      vs[node_id].copy(smoothed[node_id]);
-    });
+    var arbor = this.createArbor();
+    if (arbor.root) {
+      var smoothed = arbor.smoothPositions(vs, options.smooth_skeletons_sigma),
+          vertices = this.geometry['neurite'].vertices;
+      // Iterate only unique vertices: the children
+      for (var i=0; i<vertices.length; i+=2) {
+        var v = vertices[i]; // i: child, i+1: parent
+        v.copy(smoothed[v.node_id]);
+      }
+      // Root should not change position, but for completeness and future-proofing:
+      vs[arbor.root].copy(smoothed[arbor.root]);
+    }
   }
 
 	// Create edges between all connector nodes and their associated skeleton nodes,
@@ -2687,7 +4023,7 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
     v1.node_id = con[1];
 		var v2 = vs[con[0]];
 		this.createEdge(v1, v2, this.synapticTypes[con[2]]);
-		this.createSynapticSphere(v2, con[2]);
+		this.createSynapticSphere(v2, con[2], options.skeleton_node_scaling);
 	}, this);
 
 	// Place spheres on nodes with special labels, if they don't have a sphere there already
@@ -2697,13 +4033,15 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
 			if (-1 !== tagLC.indexOf('todo')) {
 				this.tags[tag].forEach(function(nodeID) {
 					if (!this.specialTagSpheres[nodeID]) {
-						this.createLabelSphere(vs[nodeID], this.space.staticContent.labelColors.todo);
+						this.createLabelSphere(vs[nodeID], this.space.staticContent.labelColors.todo,
+							options.skeleton_node_scaling);
 					}
 				}, this);
 			} else if (-1 !== tagLC.indexOf('uncertain')) {
 				this.tags[tag].forEach(function(nodeID) {
 					if (!this.specialTagSpheres[nodeID]) {
-						this.createLabelSphere(vs[nodeID], this.space.staticContent.labelColors.uncertain);
+						this.createLabelSphere(vs[nodeID], this.space.staticContent.labelColors.uncertain,
+							options.skeleton_node_scaling);
 					}
 				}, this);
 			}
@@ -2711,28 +4049,35 @@ WebGLApplication.prototype.Space.prototype.Skeleton.prototype.reinit_actor = fun
 	}
 
   if (options.resample_skeletons) {
+    if (options.smooth_skeletons) {
+      // Can't both smooth and resample
+      return;
+    }
     // WARNING: node IDs no longer resemble actual skeleton IDs.
     // All node IDs will now have negative values to avoid accidental similarities.
-    var res = this.createArbor().resampleSlabs(vs, options.smooth_skeletons_sigma, options.resampling_delta, 2);
-    var vs = this.geometry['neurite'].vertices;
-    // Remove existing lines
-    vs.length = 0;
-    // Add all new lines
-    var edges = res.arbor.edges,
-        positions = res.positions;
-    Object.keys(edges).forEach(function(nodeID) {
-      // Fix up Vector3 instances
-      var v_child = positions[nodeID];
-      v_child.user_id = -1;
-      v_child.node_id = -nodeID;
-      // Add line
-      vs.push(v_child);
-      vs.push(positions[edges[nodeID]]); // parent
-    });
-    // Fix up root
-    var v_root = positions[res.arbor.root];
-    v_root.user_id = -1;
-    v_root.node_id = -res.arbor.root;
+    var arbor = this.createArbor();
+    if (arbor.root) {
+      var res = arbor.resampleSlabs(vs, options.smooth_skeletons_sigma, options.resampling_delta, 2);
+      var vs = this.geometry['neurite'].vertices;
+      // Remove existing lines
+      vs.length = 0;
+      // Add all new lines
+      var edges = res.arbor.edges,
+          positions = res.positions;
+      Object.keys(edges).forEach(function(nodeID) {
+        // Fix up Vector3 instances
+        var v_child = positions[nodeID];
+        v_child.user_id = -1;
+        v_child.node_id = -nodeID;
+        // Add line
+        vs.push(v_child);
+        vs.push(positions[edges[nodeID]]); // parent
+      });
+      // Fix up root
+      var v_root = positions[res.arbor.root];
+      v_root.user_id = -1;
+      v_root.node_id = -res.arbor.root;
+    }
   }
 };
 
@@ -2820,3 +4165,558 @@ WebGLApplication.prototype.toggleInvertShading = function() {
   if (this.options.shading_method === 'none') return;
   this.set_shading_method();
 };
+
+WebGLApplication.prototype.setFollowActive = function(value) {
+  this.options.follow_active = value ? true : false;
+  this.space.render();
+};
+
+WebGLApplication.prototype.adjustStaticContent = function() {
+  this.space.staticContent.adjust(this.options, this.space);
+  this.space.render();
+};
+
+WebGLApplication.prototype.adjustContent = function() {
+  this.space.content.adjust(this.options, this.space, this.submit);
+  this.space.render();
+};
+
+/**
+ * Handle project location change. Static content like the z plane will be
+ * updated.
+ */
+WebGLApplication.prototype.handlelLocationChange = function() {
+  this.space.staticContent.updateZPlanePosition(this.space, project.focusedStackViewer);
+  this.space.render();
+};
+
+WebGLApplication.prototype._validate = function(number, error_msg, min) {
+  if (!number) return null;
+  var min = typeof(min) === "number" ? min : 1.0;
+  var value = +number; // cast
+  if (Number.isNaN(value) || value < min) return CATMAID.warn(error_msg);
+  return value;
+};
+
+WebGLApplication.prototype.updateSynapseClusteringBandwidth = function(value) {
+  value = this._validate(value, "Invalid synapse clustering value");
+  if (!value) return;
+  this.options.synapse_clustering_bandwidth = value;
+  if ('synapse-clustering' === this.options.connector_color) {
+    var skeletons = this.space.content.skeletons;
+    this.space.updateConnectorColors(this.options, Object.keys(skeletons).map(function(skid) { return skeletons[skid]; }, this));
+  }
+  this.space.render();
+};
+
+WebGLApplication.prototype.updateSkeletonLineWidth = function(value) {
+  value = this._validate(value, "Invalid skeleton line width value");
+  if (!value) return;
+  this.options.skeleton_line_width = value;
+  var sks = this.space.content.skeletons;
+  Object.keys(sks).forEach(function(skid) { sks[skid].changeSkeletonLineWidth(value); });
+  this.space.render();
+};
+
+WebGLApplication.prototype.updateSkeletonNodeHandleScaling = function(value) {
+  value = this._validate(value, "Invalid skeleton node scaling value", 0);
+  if (!value) return;
+  this.options.skeleton_node_scaling = value;
+  var sks = this.space.content.skeletons;
+  Object.keys(sks).forEach(function(skid) { sks[skid].scaleNodeHandles(value); });
+  this.space.render();
+};
+
+WebGLApplication.prototype.updateSmoothSkeletonsSigma = function(value) {
+  value = this._validate(value, "Invalid sigma value");
+  if (!value) return;
+  this.options.smooth_skeletons_sigma = value;
+  if (this.options.smooth_skeletons) this.updateSkeletons();
+};
+
+WebGLApplication.prototype.updateResampleDelta = function(value) {
+  value = this._validate(value, "Invalid resample delta");
+  if (!value) return;
+  this.options.resampling_delta = value;
+  if (this.options.resample_skeletons) this.updateSkeletons();
+};
+
+WebGLApplication.prototype.createMeshColorButton = function() {
+  var mesh_color = '#meshes-color' + this.widgetID,
+      mesh_opacity = '#mesh-opacity' + this.widgetID,
+      mesh_colorwheel = '#mesh-colorwheel' + this.widgetID;
+  var onchange = (function(color, alpha) {
+    color = new THREE.Color().setRGB(parseInt(color.r) / 255.0,
+        parseInt(color.g) / 255.0, parseInt(color.b) / 255.0);
+    $(mesh_color).css('background-color', color.getStyle());
+    $(mesh_opacity).text(alpha.toFixed(2));
+    this.options.meshes_color = $(mesh_color).css('background-color').replace(/\s/g, '');
+    if (this.options.show_meshes) {
+      var material = this.options.createMeshMaterial(color, alpha);
+      this.space.content.meshes.forEach(function(mesh) {
+        mesh.material = material;
+      });
+      this.space.render();
+    }
+  }).bind(this);
+
+  // Defaults for initialization:
+  var options = WebGLApplication.prototype.OPTIONS;
+
+  var c = $(document.createElement("button")).attr({
+      id: mesh_color.slice(1),
+      value: 'color'
+    })
+      .css('background-color', options.meshes_color)
+      .click( function( event )
+      {
+        var sel = $(mesh_colorwheel);
+        if (sel.is(':hidden')) {
+          var cw = Raphael.colorwheel(sel[0], 150);
+          cw.color($(mesh_color).css('background-color'),
+                   $(mesh_opacity).text());
+          cw.onchange(onchange);
+          sel.show();
+        } else {
+          sel.hide();
+          sel.empty();
+        }
+      })
+      .text('color')
+      .get(0);
+  var div = document.createElement('span');
+  div.appendChild(c);
+  div.appendChild($(
+    '<span>(Opacity: <span id="' + mesh_opacity.slice(1) + '">' +
+      options.meshes_opacity + '</span>)</span>').get(0));
+  div.appendChild($('<div id="' + mesh_colorwheel.slice(1) + '">').hide().get(0));
+  return div;
+};
+
+WebGLApplication.prototype.updateActiveNodeNeighborhoodRadius = function(value) {
+  value = this._validate(value, "Invalid value");
+  if (!value) return;
+  this.options.distance_to_active_node = value;
+  if ('near_active_node' === this.options.shading_method) {
+    var skid = SkeletonAnnotations.getActiveSkeletonId();
+    if (skid) {
+      var skeleton = this.space.content.skeletons[skid];
+      if (skeleton) {
+        skeleton.updateSkeletonColor(this.options);
+        this.space.render();
+      }
+    }
+  }
+};
+
+WebGLApplication.prototype.updateShadingParameter = function(param, value, shading_method) {
+  if (!this.options.hasOwnProperty(param)) {
+    console.log("Invalid options parameter: ", param);
+    return;
+  }
+  if (shading_method === 'downstream-of-tag') {
+    this.options[param] = value;
+  } else {
+    // Numerical only
+    value = this._validate(value, "Invalid value");
+    if (!value || value === this.options[param]) return;
+    this.options[param] = value;
+  }
+  if (shading_method === this.options.shading_method) {
+    this.updateSkeletonColors();
+  }
+};
+
+/**
+ * Render loop for the given animation.
+ */
+WebGLApplication.prototype.renderAnimation = function(animation, t)
+{
+  // Make sure we know this animation
+  this.animation = animation;
+  // Quere next frame for next time point
+  this.animationRequestId = window.requestAnimationFrame(
+      this.renderAnimation.bind(this, animation, t + 1));
+
+  // Update animation and then render
+  animation.update(t);
+  this.space.render();
+};
+
+/**
+ * Start the given animation.
+ */
+WebGLApplication.prototype.startAnimation = function(animation)
+{
+  if (this.animationRequestId) {
+    CATMAID.info('There is already an animation running');
+    return;
+  }
+
+  if (!animation) {
+    CATMAID.error("Please provide an animation to play.");
+    return;
+  }
+
+  // Start animation at time point 0
+  this.renderAnimation(animation, 0);
+};
+
+/**
+ * Stop the current animation.
+ */
+WebGLApplication.prototype.stopAnimation = function()
+{
+  if (this.animationRequestId) {
+    window.cancelAnimationFrame(this.animationRequestId);
+    this.animationRequestId = undefined;
+  }
+
+  if (this.animation) {
+    if (this.animation.stop) {
+      this.animation.stop();
+    }
+    this.animation = undefined;
+  }
+};
+
+/**
+ * Create a new animation, based on the 3D viewers current state.
+ */
+WebGLApplication.prototype.createAnimation = function()
+{
+  // For now it is always the Y axis rotation
+  var options = {
+    type: 'rotation',
+    axis: this.options.animation_axis,
+    camera: this.space.view.camera,
+    target: this.space.view.controls.target,
+    speed: this.options.animation_rotation_speed,
+    backandforth: this.options.animation_back_forth,
+  };
+
+  // Add a notification handler for stepwise visibility, if enabled and at least
+  // one skeleton is loaded.
+  if (this.options.animation_stepwise_visibility) {
+    // Get current visibility map and create notify handler
+    var visMap = this.space.getVisibilityMap();
+    options['notify'] = this.createStepwiseVisibilityHandler(visMap);
+    // Create a stop handler that resets visibility to the state we found before
+    // the animation.
+    options['stop'] = this.createVisibibilityResetHandler(visMap);
+  }
+
+  return CATMAID.AnimationFactory.createAnimation(options);
+};
+
+/**
+ * Create a notification handler to be used with animations that will make
+ * an additional neuron visibile with every call.
+ */
+WebGLApplication.prototype.createStepwiseVisibilityHandler = function(visMap)
+{
+  // Get all visible skeletons
+  var skeletonIds = Object.keys(this.space.content.skeletons)
+      .filter(function(skid) {
+         return this[skid].visible;
+      }, this.space.content.skeletons);
+
+  // Return no-op handler if there are no skeletons
+  if (skeletonIds.length === 0) {
+    return function() {};
+  }
+
+  // Only make first skeleton visible
+  var visibleSkeletons = [skeletonIds[0]];
+  this.space.setSkeletonVisibility(visMap, visibleSkeletons);
+
+  var widget = this;
+
+  // Create function to make one skeleton visible per rotation
+  return function (r) {
+    // Expect r to be the numnber of rotations done
+    var skeletonIndex = parseInt(r);
+    // Make next skeleton visible, if available
+    if (skeletonIndex < skeletonIds.length) {
+      visibleSkeletons.push(skeletonIds[skeletonIndex]);
+      widget.space.setSkeletonVisibility(visMap, visibleSkeletons);
+    }
+  };
+};
+
+/**
+ * Create a handler function that resets visibility of all loaded skeletons.
+ */
+WebGLApplication.prototype.createVisibibilityResetHandler = function(visMap)
+{
+  return (function() {
+    this.space.setSkeletonVisibility(visMap);
+    this.space.render();
+  }).bind(this);
+};
+
+/**
+ * Export an animation as WebM video (if the browser supports it). First, a
+ * dialog is shown to adjust export preferences.
+ */
+WebGLApplication.prototype.exportAnimation = function()
+{
+  var dialog = new CATMAID.OptionsDialog("Animation export options");
+  dialog.appendMessage('Adjust the animation export settings to your liking. ' +
+     'The resulting file will be in WebM format and might take some seconds ' +
+     'to be generated. The default frame size matches the current size of ' +
+     'the 3D viewer.');
+
+  // Add options to dialog
+  var rotationsField = dialog.appendField("# Rotations: ",
+      "animation-export-num-rotations", '1');
+  var rotationtimeField = dialog.appendField("Rotation time (s): ",
+      "animation-export-rotation-time", '5');
+  var frameWidthField = dialog.appendField("Frame width (px): ",
+      "animation-export-frame-width", this.space.canvasWidth);
+  var frameHeightField = dialog.appendField("Frame height (px): ",
+      "animation-export-frame-height", this.space.canvasHeight);
+  var framerateField = dialog.appendField("Frame rate: ",
+      "animation-export-frame-rate", '25');
+  var backforthField = dialog.appendCheckbox('Back and forth',
+      'animation-export-backforth', false);
+  var stepVisibilityField = dialog.appendCheckbox('Stepwise neuron visibility',
+      'animation-export-backforth', false);
+  var camera = this.space.view.camera;
+  var target = this.space.view.controls.target;
+
+  dialog.onOK = handleOK.bind(this);
+
+  dialog.show(400, 450, true);
+
+  function handleOK() {
+    /* jshint validthis: true */ // `this` is bound to this WebGLApplication
+    $.blockUI();
+
+    // Get current visibility
+    var visMap = this.space.getVisibilityMap();
+
+    createAnimation.call(this);
+
+    function createAnimation() {
+      // Get current visibility map and create notify handler
+      var visMap = this.space.getVisibilityMap();
+
+      try {
+        var axis = "up";
+        var rotations = parseInt(rotationsField.value);
+        var rotationtime = parseFloat(rotationtimeField.value);
+        var framerate = parseInt(framerateField.value);
+
+        var nframes = Math.ceil(rotations * rotationtime * framerate);
+        var speed = 2 * Math.PI / (rotationtime * framerate);
+        var width = parseInt(frameWidthField.value);
+        var height = parseInt(frameHeightField.value);
+
+        // Collect options
+        var options = {
+          type: 'rotation',
+          axis: axis,
+          speed: speed,
+          camera: camera,
+          target: target,
+          backandforth: backforthField.checked,
+        };
+
+        // Add a notification handler for stepwise visibility, if enabled and at least
+        // one skeleton is loaded.
+        if (stepVisibilityField.checked) {
+          options['notify'] = this.createStepwiseVisibilityHandler(visMap);
+          // Create a stop handler that resets visibility to the state we found before
+          // the animation.
+          options['stop'] = this.createVisibibilityResetHandler(visMap);
+        }
+
+        // Get frame images
+        var animation = CATMAID.AnimationFactory.createAnimation(options);
+        var images = this.getAnimationFrames(animation, nframes, undefined, width, height);
+
+        // Export movie
+        var output = Whammy.fromImageArray(images, framerate);
+        saveAs(output, "catmaid_3d_view.webm");
+      } catch (e) {
+        // Unblock UI and re-throw exception
+        $.unblockUI();
+        throw e;
+      }
+      // Reset visibility and unblock UI
+      this.space.setSkeletonVisibility(visMap);
+      $.unblockUI();
+    }
+  }
+};
+
+/**
+ * Create a list of images for a given animation and the corresponding options.
+ * By default, 100 frames are generated, starting from timepoint zero.
+ */
+WebGLApplication.prototype.getAnimationFrames = function(animation, nframes,
+    startTime, width, height)
+{
+  // Save current dimensions and set new ones, if available
+  var originalWidth, originalHeight;
+  if (width && height) {
+    if (width !== this.space.canvasWidth || height !== this.space.canvasHeight) {
+      originalWidth = this.space.canvasWidth;
+      originalHeight = this.space.canvasHeight;
+      this.resizeView(width, height);
+    }
+  }
+
+  nframes = nframes || 100;
+  startTime = startTime || 0;
+  var frames = new Array(nframes);
+  for (var i=0; i<nframes; ++i) {
+    animation.update(startTime + i);
+    this.space.render();
+
+    // Store image
+    frames[i] = this.space.view.getImageData('image/webp');
+  }
+
+  // Restore original dimensions
+  if (originalWidth && originalHeight) {
+    this.resizeView(originalWidth, originalHeight);
+  }
+
+  return frames;
+};
+
+
+(function(CATMAID) {
+
+  /**
+   * Create new animations.
+   */
+  CATMAID.AnimationFactory = (function()
+  {
+    function getOption(options, key) {
+      if (options[key]) {
+        return options[key];
+      } else {
+        throw Error("Option not found: " + key);
+      }
+    }
+
+    return {
+
+      /**
+       * Create a new animation instance.
+       */
+      createAnimation: function(options) {
+        options = options || {};
+
+        var animation = {};
+
+        var notify = options.notify || false;
+
+        if (options.type == "rotation") {
+          var axis = options.axis || "up";
+          var camera = getOption(options, "camera");
+          var target = getOption(options, "target");
+          var speed = getOption(options, "speed");
+          var backAndForth = options.backandforth || false;
+
+          // Create rotation axis
+          if ("up" === axis) {
+            axis = camera.up.clone().normalize();
+          } else if ("x" === axis) {
+            axis = new THREE.Vector3(1, 0, 0);
+          } else if ("y" === axis) {
+            axis = new THREE.Vector3(0, 1, 0);
+          } else if ("z" === axis) {
+            axis = new THREE.Vector3(0, 0, 1);
+          } else {
+            throw Error("Could not create animation, unknown axis: " + axis);
+          }
+
+          // Make sure rotation axis, camera and target are not collinear. Throw
+          // an error if they are. This is the case when the cross product
+          // between the axis and the vector from target to camera produces a
+          // null vector.
+          var tc = camera.position.clone().sub(target);
+          if (tc.cross(axis).length() < 0.0001) {
+            throw new CATMAID.ValueError("Could not create animation, both " +
+                "camera and target are positioned on the rotation axis.");
+          }
+
+          animation.update = CATMAID.AnimationFactory.AxisRotation(camera,
+              target, axis, speed, backAndForth, notify);
+        } else {
+          throw Error("Could not create animation, don't know type: " +
+              options.type);
+        }
+
+        // Add stop handler
+        var stop = options.stop || false;
+        animation.stop = function() {
+          if (stop) {
+            stop();
+          }
+        };
+
+        return animation;
+      },
+
+    };
+  })();
+
+  /**
+   * Rotate the camera around a particula axis through the the target position,
+   * while keeping the same distance to it. Optionally, a rotation speed can be
+   * passed. If back-and-forth mode is turned on, the rotation won't continue
+   * after a full circle, but reverse direction. A notification function can be
+   * passed in. It is called every full circle.
+   */
+  CATMAID.AnimationFactory.AxisRotation = function(camera, targetPosition, axis, rSpeed,
+      backAndForth, notify)
+  {
+    // Counts the number of rotations done
+    var numRotations = 0;
+
+    var targetDistance = camera.position.distanceTo(targetPosition);
+    rSpeed = rSpeed || 0.01;
+    backAndForth = backAndForth || false;
+
+    // Start position for the rotation, relative to the target
+    var startPosition = camera.position.clone().sub(targetPosition);
+
+    var m = new THREE.Matrix4();
+
+    // Return update function
+    return function(t) {
+      // Angle to rotate
+      var rad = rSpeed * t;
+
+      // Get current number of rotations
+      var currentRotation = Math.floor(rad / (2 * Math.PI));
+      if (currentRotation !== numRotations) {
+        numRotations = currentRotation;
+        // Call notification function, if any
+        if (notify) {
+          notify(currentRotation);
+        }
+      }
+
+      // In back and forth mode, movement direction is reversed once a full circle
+      // is reached.
+      if (backAndForth) {
+        rad = (currentRotation % 2) === 0 ? rad : -rad;
+      }
+
+      // Set matrix to a rotation around a certain axis
+      m.makeRotationAxis(axis, rad);
+
+      // Rotate the camera around this axis by using a copy of the start position
+      // (relative to target), rotating it and make it a world position by adding
+      // it to the target.
+      camera.position.copy(startPosition).applyMatrix4(m).add(targetPosition);
+    };
+  };
+
+})(CATMAID);

@@ -1,5 +1,12 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  project,
+  requestQueue,
+  SelectionTable,
+  User,
+  WindowMaker
+*/
 
 "use strict";
 
@@ -22,7 +29,7 @@ var ProjectStatistics = new function()
       var link = '<a href="#" data-from="' + data.from + '" data-to="' +
           data.to + '" data-type="' + type +'" data-user="' + data.user + '">' + num + '</a>';
       return link;
-    };
+    }
 
     var entry = '', points = 0;
     if( data.hasOwnProperty('new_treenodes') && data['new_treenodes'] > 0 ) {
@@ -169,11 +176,11 @@ var ProjectStatistics = new function()
 
           // Query all neurons reviewed by the given user in the given timeframe
           requestQueue.register(django_url + project.id + '/skeleton/list',
-              'GET', params, jsonResponseHandler(function(skeleton_ids) {
+              'GET', params, CATMAID.jsonResponseHandler(function(skeleton_ids) {
                 // Open a new selection table with the returned set of
                 // skeleton IDs, if any.
                 if (0 === skeleton_ids.length) {
-                  growlAlert('Information', 'No skeletons found for your selection');
+                  CATMAID.info('No skeletons found for your selection');
                   return;
                 }
                 var ST = new SelectionTable();
@@ -194,13 +201,13 @@ var ProjectStatistics = new function()
                 completed_by: user_id,
                 from: from,
                 to: to,
-              }, jsonResponseHandler(function(connectors) {
+              }, CATMAID.jsonResponseHandler(function(connectors) {
                 if (0 === connectors.length) {
-                  growlAlert('Information', 'No connectors found for your selection');
+                  CATMAID.info('No connectors found for your selection');
                   return;
                 }
 
-                ConnectorSelection.show_connectors(connectors);
+                CATMAID.ConnectorSelection.show_connectors(connectors);
               }));
           break;
         default:
@@ -214,8 +221,13 @@ var ProjectStatistics = new function()
     var x = 90, y = 100, radius = 80, height = 200;
     // Create basic pie chart without any labels
     var rpie = Raphael(chart_name, '100%', height);
+    var colorizer = d3.scale.category10();
+    // WARNING: Raphael will change the data.values array in place, shortening it
+    // and replacing the long tail of low values to a single entry that
+    // is annotated with the boolean flag "others".
+    // The parameter maxSlices should be accepted but it is ignored.
     var pie = rpie.piechart(x, y, radius, data.values, {
-        colors: ['red', 'blue', 'green', 'yellow', 'orange', 'black', 'gray'],
+        colors: data.values.map(function(v, i) { return colorizer(i);}),
     });
 
     /* Manually draw labels, because the legend can easily grow to large and

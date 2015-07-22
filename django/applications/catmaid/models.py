@@ -9,7 +9,7 @@ import re
 import urllib
 
 from django.conf import settings
-from django.contrib.auth.models import User
+from django.contrib.auth.models import User, Group
 
 from fields import Double3DField, Integer3DField, RGBAField
 
@@ -493,6 +493,18 @@ class Review(models.Model):
     skeleton = models.ForeignKey(ClassInstance)
     treenode = models.ForeignKey(Treenode)
 
+class ReviewerWhitelist(models.Model):
+    """ This model represents that a user trusts the reviews of a partciular
+    reviewer for a specific project created after a specified time.
+    """
+    class Meta:
+        db_table = "reviewer_whitelist"
+        unique_together = ('project', 'user', 'reviewer')
+    project = models.ForeignKey(Project)
+    user = models.ForeignKey(User)
+    reviewer = models.ForeignKey(User, related_name='+')
+    accept_after = models.DateTimeField(default=datetime.min)
+
 class RegionOfInterest(UserFocusedModel):
     class Meta:
         db_table = "region_of_interest"
@@ -652,14 +664,6 @@ class CardinalityRestriction(models.Model):
         else:
             raise Exception("Unsupported cardinality type.")
 
-#class Session(models.Model):
-#    class Meta:
-#        db_table = "sessions"
-#        managed = False
-#    session_id = models.CharField(max_length=26)
-#    data = models.TextField(default='')
-#    last_accessed = models.DateTimeField(default=now)
-
 # ------------------------------------------------------------------------
 # Now the non-Django tables:
 
@@ -776,11 +780,17 @@ class UserProfile(models.Model):
         default=settings.PROFILE_SHOW_TRACING_TOOL)
     show_ontology_tool = models.BooleanField(
         default=settings.PROFILE_SHOW_ONTOLOGY_TOOL)
+    show_roi_tool = models.BooleanField(
+        default=settings.PROFILE_SHOW_ROI_TOOL)
     color = RGBAField(default=distinct_user_color)
     tracing_overlay_screen_scaling = models.BooleanField(
         default=settings.PROFILE_TRACING_OVERLAY_SCREEN_SCALING)
     tracing_overlay_scale = models.FloatField(
         default=settings.PROFILE_TRACING_OVERLAY_SCALE)
+    prefer_webgl_layers = models.BooleanField(
+        default=settings.PROFILE_PREFER_WEBGL_LAYERS)
+    use_cursor_following_zoom = models.BooleanField(
+        default=settings.PROFILE_USE_CURSOR_FOLLOWING_ZOOM)
 
     def __unicode__(self):
         return self.user.username
@@ -800,8 +810,11 @@ class UserProfile(models.Model):
         pdict['show_segmentation_tool'] = self.show_segmentation_tool
         pdict['show_tracing_tool'] = self.show_tracing_tool
         pdict['show_ontology_tool'] = self.show_ontology_tool
+        pdict['show_roi_tool'] = self.show_roi_tool
         pdict['tracing_overlay_screen_scaling'] = self.tracing_overlay_screen_scaling
         pdict['tracing_overlay_scale'] = self.tracing_overlay_scale
+        pdict['prefer_webgl_layers'] = self.prefer_webgl_layers
+        pdict['use_cursor_following_zoom'] = self.use_cursor_following_zoom
         return pdict
 
     # Fix a problem with duplicate keys when new users are added.
@@ -828,6 +841,19 @@ def create_user_profile(sender, instance, created, **kwargs):
 # creation
 post_save.connect(create_user_profile, sender=User)
 
+def add_user_to_default_groups(sender, instance, created, **kwargs):
+    if created and settings.NEW_USER_DEFAULT_GROUPS:
+        for group in settings.NEW_USER_DEFAULT_GROUPS:
+            try:
+                g = Group.objects.get(name=group)
+                g.user_set.add(instance)
+            except Group.DoesNotExist:
+                print("Default group %s does not exist" % group)
+
+# Connect the a User object's post save signal to the profile
+# creation
+post_save.connect(add_user_to_default_groups, sender=User)
+
 # Prevent interactive question about wanting a superuser created.  (This code
 # has to go in this "models" module so that it gets processed by the "syncdb"
 # command during database creation.)
@@ -841,23 +867,6 @@ post_syncdb.disconnect(
     create_superuser,
     sender=auth_models,
     dispatch_uid='django.contrib.auth.management.create_superuser')
-
-# ------------------------------------------------------------------------
-
-# Include models for deprecated PHP-only tables, just so that we can
-# remove them with South in a later migration.
-
-class DeprecatedAppliedMigrations(models.Model):
-    class Meta:
-        db_table = "applied_migrations"
-    id = models.CharField(max_length=32, primary_key=True)
-
-class DeprecatedSession(models.Model):
-    class Meta:
-        db_table = "sessions"
-    session_id = models.CharField(max_length=26)
-    data = models.TextField(default='')
-    last_accessed = models.DateTimeField(default=datetime.now)
 
 
 class ChangeRequest(UserFocusedModel):

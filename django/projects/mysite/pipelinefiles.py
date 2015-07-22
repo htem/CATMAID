@@ -18,7 +18,7 @@ from collections import OrderedDict
 PIPELINE_CSS = {
     'libraries': {
         'source_filenames': (
-            'libs/jquery/themes/smoothness/jquery-ui-1.10.1.custom.css',
+            'libs/jquery/themes/smoothness/jquery-ui.css',
             'libs/jquery/datatable/css/demo_table.css',
             'libs/jquery/datatable/extras/ColReorder/css/dataTables.colReorder.css',
             'libs/jquery/jquery.growl.css',
@@ -43,21 +43,28 @@ PIPELINE_CSS = {
 
 libraries_js = {
     'modernizr': ['*.js'],
-    'jquery': ['jquery.js', 'jquery-ui-1.10.1.custom.min.js',
-               'jquery.dataTables.js', '*.js'],
+    'jquery': ['jquery-2.1.3.min.js', 'jquery-migrate-1.2.1.js',
+               'jquery-ui.min.js', 'jquery-ui.*.js',
+               'jquery.dataTables.min.js', 'jquery.*.js',
+               'dataTables.colReorder.js'],
     'fabric.js': ['all.modified.js'],
     'raphael': ['raphael.js', 'g.raphael.js', 'g.pie-min.js', 'g.line.altered.js',
                 'raphael-custom.js', 'colorwheel.js', 'raphael.export.js'],
-    'd3': ['d3.v3.js', 'venn.js', 'mds.js'],
+    'd3': ['d3.v3.js', 'venn.js', 'mds.js', 'colorbrewer.js'],
     'sylvester': ['sylvester.js'],
     'numeric': ['numeric-1.2.6.js'],
-    'three.js': ['three.js', 'js/controls/TrackballControls.js', 'js/Detector.js',
-                 'helvetiker_regular.typeface.js'],
+    'three.js': ['three.js', 'controls/TrackballControls.js',
+                 'camera/CombinedCamera.js', 'Detector.js',
+                 'helvetiker_regular.typeface.js',
+                 'renderer/Projector.js', 'renderer/SVGRenderer.js'],
     'threex': ['*.js'],
+    'pixi.js': ['*.js'],
     'cytoscapejs': ['cytoscape.js'],
     'jsnetworkx': ['*.js'],
     'filesaver': ['*.js'],
-    'catmaid': ['*.js'],
+    'whammy': ['whammy.js'],
+    'catmaid': ['request.js', 'CATMAID.js', 'error.js', 'events.js',
+                'neuron_controller.js', 'skeleton_source.js', '*.js'],
 }
 
 PIPELINE_JS = OrderedDict()
@@ -70,25 +77,23 @@ for k,v in libraries_js.iteritems():
 
 PIPELINE_JS['arbor'] = {
     'source_filenames': ('libs/cytoscapejs/arbor.js',),
-    'output_filename': 'js/arbor.js'
+    'output_filename': 'libs/cytoscapejs/arbor.js'
 }
 
 PIPELINE_JS['catmaid'] = {
     'source_filenames': (
+        'js/CATMAID.js',
+        'js/extensions.js',
         'js/action.js',
-        'js/connectorselection.js',
         'js/init.js',
-        'js/measurements_table.js',
         'js/navigator.js',
         'js/network-api.js',
-        'js/neuronstagingarea.js',
-        'js/ontologytool.js',
         'js/overview.js',
         'js/project.js',
         'js/segmentationtool.js',
         'js/selector.js',
         'js/stack.js',
-        'js/taggingtool.js',
+        'js/stack-viewer.js',
         'js/tilelayercontrol.js',
         'js/tilelayer.js',
         'js/tilesource.js',
@@ -101,6 +106,7 @@ PIPELINE_JS['catmaid'] = {
         'js/tools/boxselectiontool.js',
         'js/tools/roitool.js',
         'js/tools/*.js',
+        'js/layers/pixi-layer.js',
         'js/layers/*.js',
         'js/widgets/*.js',
     ),

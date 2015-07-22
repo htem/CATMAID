@@ -1,5 +1,13 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  CATMAID,
+  InstanceRegistry,
+  project,
+  requestQueue,
+  SelectionTable,
+  SkeletonAnnotations
+*/
 
 "use strict";
 
@@ -16,22 +24,39 @@ var NeuronDendrogram = function() {
   this.showStrahler = false;
   this.radialDisplay = true;
   this.minStrahler = 1;
+  this.collapseNotABranch = true;
+  this.warnCollapsed = true;
+  this.highlightTags = [];
 
   // Stores a reference to the current SVG, if any
   this.svg = null;
   // The current translation and scale, to preserve state between updates
   this.translation = null;
-  this.scale = null;;
+  this.scale = null;
+  // The last node selected
+  this.selectedNodeId = null;
 
-  // Listen to change events of the active node
+  // Indicates if an update is currently in progress
+  this.updating = false;
+  // Indicates whether the widget should update automatically if the skeleton
+  // changes.
+  this.autoUpdate = true;
+
+  // Multipliers for horizontal node spacing and vertical leaf spacing
+  this.hNodeSpaceFactor = 1.0;
+  this.vNodeSpaceFactor = 1.0;
+
+  // Listen to change events of the active node and skeletons
   SkeletonAnnotations.on(SkeletonAnnotations.EVENT_ACTIVE_NODE_CHANGED,
       this.selectActiveNode, this);
+  SkeletonAnnotations.on(SkeletonAnnotations.EVENT_SKELETON_CHANGED,
+      this.handleSkeletonChange, this);
 };
 
 NeuronDendrogram.prototype = {};
 $.extend(NeuronDendrogram.prototype, new InstanceRegistry());
-$.extend(NeuronDendrogram.prototype, new SkeletonSource());
-$.extend(NeuronDendrogram.prototype, Events.Event);
+$.extend(NeuronDendrogram.prototype, new CATMAID.SkeletonSource());
+$.extend(NeuronDendrogram.prototype, CATMAID.Events.Event);
 
 /* Implement interfaces */
 
@@ -43,6 +68,8 @@ NeuronDendrogram.prototype.getName = function()
 NeuronDendrogram.prototype.destroy = function() {
   SkeletonAnnotations.off(SkeletonAnnotations.EVENT_ACTIVE_NODE_CHANGED,
       this.selectActiveNode, this);
+  SkeletonAnnotations.off(SkeletonAnnotations.EVENT_SKELETON_CHANGED,
+      this.handleSkeletonChange, this);
   this.unregisterInstance();
   this.unregisterSource();
 };
@@ -99,7 +126,7 @@ NeuronDendrogram.prototype.selectActiveNode = function(activeNode)
   } else {
     this.resetHighlighting();
   }
-}
+};
 
 /**
  * Will select the node with the given ID, if its skeleton is laoded. If the
@@ -107,41 +134,118 @@ NeuronDendrogram.prototype.selectActiveNode = function(activeNode)
  */
 NeuronDendrogram.prototype.selectNode = function(node_id, skeleton_id)
 {
+  // If there is an update in progress, currently, then wait for it to finish
+  if (this.updating) {
+    // Try again in 100ms
+    setTimeout(this.selectNode.bind(this, node_id, skeleton_id), 100);
+    return;
+  }
+
   if (!node_id || skeleton_id !== this.currentSkeletonId || !this.renderTree) {
+    this.selectedNodeId = null;
     this.resetHighlighting();
     return;
   }
 
-  var childToParent = this.currentSkeletonTree.reduce(function(o, n) {
+  var nodesToChildren = this.currentSkeletonTree.reduce(function(o, n) {
     // Map node ID to parent ID
-    o[n[0]] = n[1];
+    var c = o[n[0]];
+    if (!c) {
+      o[n[0]] = [];
+    }
+
+    // Map all children to parent
+    var p = o[n[1]];
+    if (!p) {
+     p = [];
+     o[n[1]] = p;
+    }
+    p.push(n[0]);
+
     return o;
   }, {});
 
+  // If a virtual node should be selected, use the real parent instead.
+  if (!SkeletonAnnotations.isRealNode(node_id)) {
+    node_id = SkeletonAnnotations.getChildOfVirtualNode(node_id);
+  }
+
+  // Make sure the requested node is part of the current skeleton
+  if (!(node_id in nodesToChildren)) {
+    if (this.autoUpdate) {
+      // Reload the skeleton and disable auto update during this time to not end
+      // in an infinite loop by accident (if the nodes cannot be retrieved).
+      this.autoUpdate = false;
+      this.loadSkeleton(this.currentSkeletonId);
+      this.selectNode(node_id, skeleton_id);
+      this.autoUpdate = true;
+    } else {
+      CATMAID.msg("Error", "The requested node (" + node_id + ") was not " +
+          "found in the internal skeleton representation. Try updating it.");
+    }
+    return;
+  }
+
+  this.selectedNodeId = node_id;
+
   // Find either node itself or closest parent
   var nodeToHighlight = node_id;
-  var numDownstreamSteps = 0;
+  var toExplore = [];
   while (true) {
     if (-1 !== this.renderedNodeIds.indexOf(nodeToHighlight)) {
       break;
     } else {
-      // Try next parent
-      numDownstreamSteps++;
-      nodeToHighlight = childToParent[nodeToHighlight];
+      // Get set of child nodes
+      toExplore.push.apply(toExplore, nodesToChildren[nodeToHighlight]);
+
+      if (0 === toExplore.length) {
+        if (this.warnCollapsed) {
+          CATMAID.info("Couldn highlight the currently selected node, because " +
+              "it is collapsed and no visible node downstream was found");
+        }
+        // Return, because the closest visible parent has been found
+        return;
+      }
+      // test next node in queue
+      nodeToHighlight = toExplore.pop();
     }
   }
 
   if (!nodeToHighlight) {
-    error("Couldn't find node to highlight in dendrogram");
+    CATMAID.error("Couldn't find node to highlight in dendrogram");
     return;
-  } else if (nodeToHighlight !== node_id) {
-    growlAlert("Information", "The active node is currently not visible in " +
-        "the dendrogram. Therefore, the next visible node downstream has " +
-        "been selected, which is " + numDownstreamSteps + " hop(s) away.");
+  } else if (nodeToHighlight !== node_id && this.warnCollapsed) {
+    var getDepth = function(node, depth) {
+      var children = nodesToChildren[node];
+      if (node === nodeToHighlight) { return depth; }
+      if (0 === children.length) { return null; }
+
+      for (var i=0; i<children.length; ++i) {
+        var result = getDepth(children[i], depth + 1);
+        if (null !== result) { return result; }
+      }
+
+      return null;
+    };
+    var numDownstreamSteps = getDepth(node_id, 0);
+
+    CATMAID.info("The active node is currently not visible in the dendrogram. " +
+       "Therefore, the next visible node downstream has been selected, which " +
+       "is " + numDownstreamSteps + " hop(s) away.");
   }
 
   this.highlightNode(nodeToHighlight);
-}
+};
+
+/**
+ * Reacts to the change in the given skeleton
+ */
+NeuronDendrogram.prototype.handleSkeletonChange = function(skeletonID)
+{
+  if (skeletonID === this.currentSkeletonId) {
+    this.loadSkeleton(skeletonID);
+  }
+};
 
 /**
  * Load the active skeleton
@@ -151,10 +255,10 @@ NeuronDendrogram.prototype.loadActiveSkeleton = function()
   var skid = SkeletonAnnotations.getActiveSkeletonId();
   if (!skid) {
     alert("There is currently no skeleton selected.");
-    return
-  } else
- 
-  this.loadSkeleton(skid)
+    return;
+  }
+
+  this.loadSkeleton(skid);
 };
 
 NeuronDendrogram.prototype.reset = function()
@@ -170,19 +274,28 @@ NeuronDendrogram.prototype.loadSkeleton = function(skid)
 {
   if (!skid) {
     alert("Please provide a skeleton ID");
+    return;
   }
+
+  // Indicate update
+  this.updating = true;
 
   // Retrieve skeleton data
   var url = django_url + project.id + '/' + skid + '/0/1/compact-skeleton';
-  requestQueue.register(url, "GET", {}, jsonResponseHandler(
+  requestQueue.register(url, "GET", {}, CATMAID.jsonResponseHandler(
         (function(data) {
           this.reset();
           this.currentSkeletonId = skid;
           this.currentSkeletonTree = data[0];
           this.currentSkeletonTags = data[2];
-          var ap  = new ArborParser().init('compact-skeleton', data);
+          var ap  = new CATMAID.ArborParser().init('compact-skeleton', data);
           this.currentArbor = ap.arbor;
           this.update();
+          this.updating = false;
+        }).bind(this),
+        (function(data) {
+          this.updating = false;
+          CATMAID.error("Neuron dendrogram: couldn't update skeleton data");
         }).bind(this)));
 };
 
@@ -200,7 +313,7 @@ NeuronDendrogram.prototype.getNodesInTree = function(rootNode)
         traverse(c, node_ids);
       });
     }
-  };
+  }
 
   var node_ids = [];
 
@@ -209,20 +322,20 @@ NeuronDendrogram.prototype.getNodesInTree = function(rootNode)
   }
 
   return node_ids;
-}
+};
 
 /**
  * Creates a tree representation of a node array. Nodes that appear in
  * taggedNodes get a label attached.
  */
-NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNodes)
+NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNodes, nodesToSkip)
 {
   /**
    * Helper to create a tree representation of a skeleton. Expects data to be of
    * the format [id, parent_id, user_id, x, y, z, radius, confidence].
    */
   var createTree = function(index, taggedNodes, data, belowTag, collapsed, strahler,
-      minStrahler)
+      minStrahler, blacklist)
   {
     var id = data[0];
     var tagged = taggedNodes.indexOf(id) != -1;
@@ -248,7 +361,8 @@ NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNode
                     (1 === index[cid].length) && // only one child?
                     taggedNodes.indexOf(cid) == -1) || // not tagged?
                    (minStrahler && // Alternatively, is min Strahler set?
-                    strahler[cid] < minStrahler);
+                    strahler[cid] < minStrahler) || // Strahler below threshold?
+                   (blacklist.indexOf(cid) !== -1); // Alternatively, blacklisted?
         if (skip) {
             // Test if child can also be skipped, if available
             var c = index[cid];
@@ -264,7 +378,7 @@ NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNode
 
       node.children = index[id].map(findNext).filter(notNull).map(function(c) {
         return createTree(index, taggedNodes, c, belowTag, collapsed, strahler,
-            minStrahler);
+            minStrahler, blacklist);
       });
 
     }
@@ -289,7 +403,7 @@ NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNode
     return;
   }
   if (parentToChildren[null].length > 1) {
-    alert("Found more than one root node. Aborting dendrogram rendering!")
+    alert("Found more than one root node. Aborting dendrogram rendering!");
     return;
   }
 
@@ -299,7 +413,7 @@ NeuronDendrogram.prototype.createTreeRepresentation = function(nodes, taggedNode
   // Create the tree, starting from the root node
   var root = parentToChildren[null][0];
   var tree = createTree(parentToChildren, taggedNodes, root, false, this.collapsed, strahler,
-      this.minStrahler);
+      this.minStrahler, nodesToSkip);
 
   return tree;
 };
@@ -317,13 +431,31 @@ NeuronDendrogram.prototype.update = function()
     return;
   }
 
-  var tag = $('input#dendrogram-tag-' + this.widgetID).val();
-  var taggedNodeIds = this.currentSkeletonTags.hasOwnProperty(tag) ? this.currentSkeletonTags[tag] : [];
-  this.renderTree = this.createTreeRepresentation(this.currentSkeletonTree, taggedNodeIds);
+  var getTaggedNodes = (function(tags)
+  {
+    var mapping = this.currentSkeletonTags;
+    // Add all tagged node IDs to result
+    return tags.reduce(function(o, tag) {
+      if (mapping.hasOwnProperty(tag)) {
+        o = o.concat(mapping[tag]);
+      }
+      return o;
+    }, []);
+  }).bind(this);
+
+  var taggedNodeIds = getTaggedNodes(this.highlightTags);
+  var blacklist = this.collapseNotABranch ? getTaggedNodes(['not a branch']): [];
+  this.renderTree = this.createTreeRepresentation(this.currentSkeletonTree, taggedNodeIds, blacklist);
   this.renderedNodeIds = this.getNodesInTree(this.renderTree);
 
   if (this.currentSkeletonTree && this.currentSkeletonTags) {
-    this.renderDendogram(this.renderTree, this.currentSkeletonTags, tag);
+    this.renderDendogram(this.renderTree, this.currentSkeletonTags,
+       this.highlightTags.join(","));
+  }
+
+  // Select the active node after every change
+  if (this.selectedNodeId && this.currentSkeletonId) {
+    this.selectNode(this.selectedNodeId, this.currentSkeletonId);
   }
 };
 
@@ -377,7 +509,7 @@ NeuronDendrogram.prototype.highlightNode = function(node_id)
   // Get the actual node
   var node = d3.select("#node" + node_id).data();
   if (node.length !== 1) {
-    error("Couldn't find node " + node_id + " in dendrogram");
+    CATMAID.error("Couldn't find node " + node_id + " in dendrogram");
     return;
   } else {
     node = node[0];
@@ -398,14 +530,14 @@ NeuronDendrogram.prototype.highlightNode = function(node_id)
 /**
   * Renders a new dendrogram containing the provided list of nodes.
   */
-NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
+NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTags)
 {
   var margin = {top: 50, right: 70, bottom: 50, left: 70};
   var baseWidth = this.container.clientWidth - margin.left - margin.right;
   var baseHeight = this.container.clientHeight - margin.top - margin.bottom;
 
-  // Adjust the width and height so that each node has at least a space of 10 by 10 pixel
-  var nodeSize = [20, 40];
+  // Adjust the width and height so that each node has at least a space of 20x80px
+  var nodeSize = [20, 80];
   var width;
   var height;
   var factor = 1;
@@ -413,14 +545,19 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
     width = baseWidth * factor;
     height = baseHeight * factor;
   } else {
-    width = Math.max(baseWidth, nodeSize[0] * this.getMaxDepth(tree));
-    height = Math.max(baseHeight, nodeSize[1] * this.getNumLeafs(tree));
+    baseWidth = this.hNodeSpaceFactor * baseWidth;
+    baseHeight = this.vNodeSpaceFactor * baseHeight;
+    width = Math.max(baseWidth, this.hNodeSpaceFactor * nodeSize[0] * this.getMaxDepth(tree));
+    height = Math.max(baseHeight, this.vNodeSpaceFactor * nodeSize[1] * this.getNumLeafs(tree));
   }
 
   // Create clustering where each leaf node has the same distance to its
   // neighbors.
+  var dendrogramSize;
+  if (this.radialDisplay) dendrogramSize = [360 * this.vNodeSpaceFactor, 360 * this.hNodeSpaceFactor];
+  else dendrogramSize = [height, width];
   var dendrogram = d3.layout.cluster()
-    .size([this.radialDisplay ? 360 * factor : height, this.radialDisplay ? 360: width])
+    .size(dendrogramSize)
     .separation(function() { return 1; });
 
   // Find default scale so that everything can be seen, if no scale is cached.
@@ -443,20 +580,20 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
   if (this.radialDisplay) {
     layoutOffset = [width / 2, height / 2];
     // Radial scales for x and y.
-    var lx = function(d) { return factor * d.y * Math.cos((d.x - 90) / 180 * Math.PI); }
-    var ly = function(d) { return factor * d.y * Math.sin((d.x - 90) / 180 * Math.PI); }
+    var lx = function(d) { return factor * d.y * Math.cos((d.x - 90) / 180 * Math.PI); };
+    var ly = function(d) { return factor * d.y * Math.sin((d.x - 90) / 180 * Math.PI); };
     pathGenerator = function(d) {
       return "M" + lx(d.source) + "," + ly(d.source)
            + "L" + lx(d.target) + "," + ly(d.target);
     };
     nodeTransform = function(d) { return "rotate(" + (d.x - 90) + ")translate(" + (d.y * factor) + ")"; };
     styleNodeText = function(node) {
-      function inner(d) { return d.children ? !(d.x > 180) : d.x > 180; }
+      function inner(d) { return d.children ? d.x <= 180 : d.x > 180; }
       return node
       .attr("dx", function(d) { return inner(d) ? -8 : 8; })
       .attr("dy", 3)
       .style("text-anchor", function(d) { return inner(d) ? "end" : "start"; })
-      .attr("transform", function(d) { return d.x > 180 ? "rotate(180)" : null; })
+      .attr("transform", function(d) { return d.x > 180 ? "rotate(180)" : null; });
     };
   } else {
     layoutOffset = [0, 0];
@@ -464,12 +601,12 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
         return "M" + d.source.y + "," + d.source.x
              + "V" + d.target.x + "H" + d.target.y;
     };
-    nodeTransform = function(d) { return "translate(" + d.y + "," + d.x + ")"; }
+    nodeTransform = function(d) { return "translate(" + d.y + "," + d.x + ")"; };
     styleNodeText = function(node) {
       return node
       .attr("dx", function(d) { return d.children ? -8 : 8; })
       .attr("dy", 3)
-      .style("text-anchor", function(d) { return d.children ? "end" : "start"; })
+      .style("text-anchor", function(d) { return d.children ? "end" : "start"; });
     };
   }
 
@@ -528,15 +665,15 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
           n.loc_y,
           n.loc_x,
           function () {
-             SkeletonAnnotations.staticSelectNode(n.id, skid);
+             SkeletonAnnotations.staticSelectNode(n.id);
           });
-      }
+      };
     }(this.currentSkeletonId);
 
   var nodeName = function(showTags, showIds, showStrahler) {
     function addTag(d, wrapped) {
       if (d.tagged) {
-        return referenceTag + (wrapped.length > 0 ? " (" + wrapped + ")" : "");
+        return referenceTags + (wrapped.length > 0 ? " (" + wrapped + ")" : "");
       } else {
         return wrapped;
       }
@@ -571,6 +708,7 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
   styleNodeText(node.append("text")).text(nodeName);
 
   function zoom() {
+    /* jshint validthis: true */ // `this` is bound to this NeuronDendrogram
     // Compensate for margin
     var tx = d3.event.translate[0] + margin.left,
         ty = d3.event.translate[1] + margin.top;
@@ -580,17 +718,18 @@ NeuronDendrogram.prototype.renderDendogram = function(tree, tags, referenceTag)
     this.translation[1] = ty;
     // Translate and scale dendrogram
     vis.attr("transform", "translate(" + tx + "," + ty + ")scale(" + d3.event.scale + ")");
-  };
+  }
 
   /**
    * Compensate for margin and layout offset.
    */
   function mouseMove() {
+    /* jshint validthis: true */ // `this` is the D3 svg object
     var m = d3.mouse(this);
     zoomHandler.center([
         m[0] - layoutOffset[0] - margin.left,
         m[1] - layoutOffset[1] - margin.top]);
-  };
+  }
 };
 
 /**
@@ -629,14 +768,7 @@ NeuronDendrogram.prototype.exportSVG = function()
     }
     return o;
   }, "");
-
-  // Prepend CSS embedded in CDATA section
-  var styleTag = xml.createElement('style');
-  styleTag.setAttribute('type', 'text/css');
-  styleTag.appendChild(xml.createCDATASection(css));
-
-  // Add style tag to SVG node in XML document (first child)
-  xml.firstChild.appendChild(styleTag);
+  CATMAID.svgutil.addStyles(xml, css);
 
   // Serialize SVG including CSS and export it as blob
   var data = new XMLSerializer().serializeToString(xml);
@@ -644,33 +776,87 @@ NeuronDendrogram.prototype.exportSVG = function()
   saveAs(blob, "dendrogram-" + this.skeletonID + "-" + this.widgetID + ".svg");
 };
 
+/**
+ * Show a dialog with a checkbox for each tag that is used in the current
+ * skeleton. A user can then select the tags that should be highlighted.
+ */
+NeuronDendrogram.prototype.chooseHighlightTags = function()
+{
+  if (!this.currentSkeletonId) {
+    CATMAID.warn("No skeleton selected");
+    return;
+  }
+
+  // Get all the tags for the current skeleton
+  var dialog = new CATMAID.OptionsDialog("Select tags to highlight");
+  dialog.appendMessage("The following tags are used in the selected " +
+      "skeleton. Every node labeled with at least one of the selected tags, " +
+      "will be highlighted and its sub-arbor will be highlighted as well.");
+
+  // Map tags to checkboxes
+  var checkboxes = {};
+  for (var tag in this.currentSkeletonTags) {
+    var checked = (-1 !== this.highlightTags.indexOf(tag));
+    checkboxes[tag] = dialog.appendCheckbox(tag, undefined, checked);
+  }
+
+  dialog.onOK = (function() {
+    this.highlightTags = Object.keys(checkboxes).filter(function(t) {
+      return checkboxes[t].checked;
+    });
+    this.update();
+  }).bind(this);
+
+  dialog.show(400, 'auto', true);
+};
+
 NeuronDendrogram.prototype.setCollapsed = function(value)
 {
-  this.collapsed = value;
+  this.collapsed = Boolean(value);
 };
 
 NeuronDendrogram.prototype.setShowNodeIds = function(value)
 {
-  this.showNodeIDs = value;
+  this.showNodeIDs = Boolean(value);
 };
 
 NeuronDendrogram.prototype.setShowTags = function(value)
 {
-  this.showTags = value;
+  this.showTags = Boolean(value);
 };
 
 NeuronDendrogram.prototype.setShowStrahler = function(value)
 {
-  this.showStrahler = value;
+  this.showStrahler = Boolean(value);
 };
 
 NeuronDendrogram.prototype.setRadialDisplay = function(value)
 {
   this.reset();
-  this.radialDisplay = value;
+  this.radialDisplay = Boolean(value);
 };
 
 NeuronDendrogram.prototype.setMinStrahler = function(value)
 {
   this.minStrahler = value;
+};
+
+NeuronDendrogram.prototype.setCollapseNotABranch = function(value)
+{
+  this.collapseNotABranch = Boolean(value);
+};
+
+NeuronDendrogram.prototype.setWarnCollapsed = function(value)
+{
+  this.warnCollapsed = Boolean(value);
+};
+
+NeuronDendrogram.prototype.setHSpaceFactor = function(value)
+{
+  this.hNodeSpaceFactor = value;
+};
+
+NeuronDendrogram.prototype.setVSpaceFactor = function(value)
+{
+  this.vNodeSpaceFactor = value;
 };

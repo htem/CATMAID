@@ -1,7 +1,7 @@
 /**
  * Overview navigator widget
  */
-function Overview( stack )
+function Overview( stackViewer )
 {
 	/**
 	 * get the view object
@@ -15,22 +15,21 @@ function Overview( stack )
 	{
 		jump : function( e )
 		{
-			var m = ui.getMouse( e, self.getView() );
+			var m = CATMAID.ui.getMouse( e, self.getView() );
 			if ( m )
 			{
-				//statusBar.replaceLast( m.offsetX + ", " + m.offsetY );
-				stack.moveToPixel( stack.z, Math.round( m.offsetY / scale ), Math.round( m.offsetX / scale ), stack.s );
+				stackViewer.moveToPixel( stackViewer.z, Math.round( m.offsetY / scale ), Math.round( m.offsetX / scale ), stackViewer.s );
 			}
 			return false;
 		},
 		drag : function( e )
 		{
-			ui.registerEvent( "onmousemove", onmousemove );
-			ui.registerEvent( "onmouseup", onmouseup );
-			ui.catchEvents( "move" );
-			ui.onmousedown( e );
+			CATMAID.ui.registerEvent( "onmousemove", onmousemove );
+			CATMAID.ui.registerEvent( "onmouseup", onmouseup );
+			CATMAID.ui.catchEvents( "move" );
+			CATMAID.ui.onmousedown( e );
 		
-			ui.catchFocus();
+			CATMAID.ui.catchFocus();
 		
 			return false;
 		}
@@ -38,15 +37,18 @@ function Overview( stack )
 	
 	var onmousemove = function( e )
 	{
-		stack.moveToPixel( stack.z, stack.y + ui.diffY / scale, stack.x + ui.diffX / scale, stack.s );
+		stackViewer.moveToPixel( stackViewer.z,
+                           stackViewer.y + CATMAID.ui.diffY / scale,
+                           stackViewer.x + CATMAID.ui.diffX / scale,
+                           stackViewer.s );
 		return false;
 	};
 	
 	var onmouseup = function( e )
 	{
-		ui.releaseEvents();
-		ui.removeEvent( "onmousemove", onmousemove );
-		ui.removeEvent( "onmouseup", onmouseup );
+		CATMAID.ui.releaseEvents();
+		CATMAID.ui.removeEvent( "onmousemove", onmousemove );
+		CATMAID.ui.removeEvent( "onmouseup", onmouseup );
 		return false;
 	};	
 	
@@ -63,12 +65,12 @@ function Overview( stack )
 			scale = Math.min( scaleX, scaleY );
 		}
 
-		var height = scale / stack.scale * stack.viewHeight;
-		var width = scale / stack.scale * stack.viewWidth;
+		var height = scale / stackViewer.scale * stackViewer.viewHeight;
+		var width = scale / stackViewer.scale * stackViewer.viewWidth;
 		rect.style.height = Math.floor( height ) + "px";
 		rect.style.width = Math.floor( width ) + "px";
-		rect.style.top = Math.floor( scale * stack.y - height / 2 ) + "px";
-		rect.style.left = Math.floor( scale * stack.x - width / 2 ) + "px";
+		rect.style.top = Math.floor( scale * stackViewer.y - height / 2 ) + "px";
+		rect.style.left = Math.floor( scale * stackViewer.x - width / 2 ) + "px";
 		
 		for ( var layer in layers )
 			layers[ layer ].redraw();
@@ -114,10 +116,8 @@ function Overview( stack )
 	var layers = {};
 	
 	// initialize
-	if ( !ui ) ui = new UI();
-	
-	var maxX = stack.dimension.x - 1;
-	var maxY = stack.dimension.y - 1;
+	var maxX = stackViewer.primaryStack.dimension.x - 1;
+	var maxY = stackViewer.primaryStack.dimension.y - 1;
 	var scale;
 
 	var view = document.createElement( "div" );

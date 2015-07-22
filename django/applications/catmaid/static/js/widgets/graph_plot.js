@@ -1,5 +1,14 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  CircuitGraphAnalysis,
+  fetchSkeletons,
+  InstanceRegistry,
+  NeuronNameService,
+  project,
+  requestQueue,
+  SynapseClustering
+*/
 
 "use strict";
 
@@ -88,7 +97,7 @@ var CircuitGraphPlot = function() {
 
 CircuitGraphPlot.prototype = {};
 $.extend(CircuitGraphPlot.prototype, new InstanceRegistry());
-$.extend(CircuitGraphPlot.prototype, new SkeletonSource());
+$.extend(CircuitGraphPlot.prototype, new CATMAID.SkeletonSource());
 
 CircuitGraphPlot.prototype.getName = function() {
 	return "Circuit Graph Plot " + this.widgetID;
@@ -221,7 +230,7 @@ CircuitGraphPlot.prototype.append = function(models) {
 
   if (skids.length < 2) {
     this.clearGUI();
-    growlAlert('Need more than one', 'Need at least two neurons!');
+    CATMAID.msg('Need more than one', 'Need at least two neurons!');
     return;
   }
 
@@ -451,7 +460,7 @@ CircuitGraphPlot.prototype.getVectors = function() {
 
   var f = (function(select) {
     var index = select.selectedIndex;
-    if (index < this.vectors.length) {
+    if (this.vectors && index < this.vectors.length) {
       return this.vectors[index][1];
     } else if ('a' === select.value[0]) {
       if (!this.anatomy) {
@@ -508,7 +517,7 @@ CircuitGraphPlot.prototype.loadAnatomy = function(callback) {
       },
       function(skid) { return {}; },
       function(skid, json) {
-        var ap = new ArborParser().init('compact-arbor', json),
+        var ap = new CATMAID.ArborParser().init('compact-arbor', json),
             arbor = ap.arbor;
 
         // Reroot at soma if possible and necessary
@@ -589,13 +598,14 @@ CircuitGraphPlot.prototype.loadAnatomy = function(callback) {
               }
             }
 
-            var cut = SynapseClustering.prototype.findAxonCut(arbor, ap.outputs, above);
-
-            var cluster1 = arbor.subArbor(cut).nodes(),
-                cluster2 = arbor.nodesArray().filter(function(node) {
-                  return undefined === cluster1[node];
-                });
-            segregationIndex = SynapseClustering.prototype.segregationIndex({0: Object.keys(cluster1), 1: cluster2}, ap.outputs, ap.inputs);
+            var cut = SynapseClustering.prototype.findAxonCut(arbor, ap.outputs, above, positions);
+            if (cut) {
+              var cluster1 = arbor.subArbor(cut).nodes(),
+                  cluster2 = arbor.nodesArray().filter(function(node) {
+                    return undefined === cluster1[node];
+                  });
+              segregationIndex = SynapseClustering.prototype.segregationIndex({0: Object.keys(cluster1), 1: cluster2}, ap.outputs, ap.inputs);
+            }
           }
           return {hillock_cable: hillock_cable,
                   main_dendritic_shaft_cable: main_dendritic_shaft_cable,
@@ -657,7 +667,7 @@ CircuitGraphPlot.prototype.loadAnatomy = function(callback) {
       },
       function(skid) {
         // Failed to load
-        growlAlert("ERROR", "Skeleton #" + skid + " failed to load.");
+        CATMAID.msg("ERROR", "Skeleton #" + skid + " failed to load.");
         measurements[skid] = null;
       },
       (function() {
@@ -871,7 +881,7 @@ CircuitGraphPlot.prototype.draw = function(xVector, xTitle, yVector, yTitle) {
   };
 
   // Variables exist throughout the scope of the function, so zoom is reachable from zoomed
-  var zoom = d3.behavior.zoom().x(xR).y(yR).scaleExtent([1, 100]).on("zoom", zoomed);
+  var zoom = d3.behavior.zoom().x(xR).y(yR).on("zoom", zoomed);
 
   // Assign the zooming behavior to the encapsulating root group
   svg.call(zoom);
@@ -912,10 +922,11 @@ CircuitGraphPlot.prototype.draw = function(xVector, xTitle, yVector, yTitle) {
   var xg = svg.append("g")
       .attr("class", "x axis")
       .attr("transform", "translate(0," + height + ")")
-      .attr("fill", "none")
-      .attr("stroke", "black")
       .style("shape-rendering", "crispEdges")
       .call(xAxis);
+  xg.selectAll("path")
+      .attr("fill", "none")
+      .attr("stroke", "black");
   xg.selectAll("text")
       .attr("fill", "black")
       .attr("stroke", "none");
@@ -931,10 +942,11 @@ CircuitGraphPlot.prototype.draw = function(xVector, xTitle, yVector, yTitle) {
 
   var yg = svg.append("g")
       .attr("class", "y axis")
-      .attr("fill", "none")
-      .attr("stroke", "black")
       .style("shape-rendering", "crispEdges")
       .call(yAxis);
+  yg.selectAll("path")
+      .attr("fill", "none")
+      .attr("stroke", "black");
   yg.selectAll("text")
       .attr("fill", "black")
       .attr("stroke", "none");
@@ -987,7 +999,8 @@ CircuitGraphPlot.prototype.highlight = function() {
 };
 
 CircuitGraphPlot.prototype.exportSVG = function() {
-  saveDivSVG('circuit_graph_plot_div' + this.widgetID, "circuit_plot.svg");
+  CATMAID.svgutil.saveDivSVG('circuit_graph_plot_div' + this.widgetID,
+      "circuit_plot.svg");
 };
 
 CircuitGraphPlot.prototype.exportCSV = function() {
@@ -1060,7 +1073,7 @@ CircuitGraphPlot.prototype.exportCSVAll = function() {
 };
 
 CircuitGraphPlot.prototype.adjustOptions = function() {
-  var od = new OptionsDialog("Parameters");
+  var od = new CATMAID.OptionsDialog("Parameters");
   od.appendField(
       "Smooth skeletons by Gaussian convolution with sigma (nm): ",
       "CGP-sigma" + this.widgetID,

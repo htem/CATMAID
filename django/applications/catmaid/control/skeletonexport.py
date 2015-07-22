@@ -6,6 +6,7 @@ from collections import defaultdict
 from math import sqrt
 from datetime import datetime
 
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection
 from django.http import HttpResponse
 
@@ -13,6 +14,7 @@ from catmaid.models import UserRole, ClassInstance, Treenode, \
         TreenodeClassInstance, ConnectorClassInstance, Review
 from catmaid.control import export_NeuroML_Level3
 from catmaid.control.authentication import requires_user_role
+from catmaid.control.common import get_relation_to_id_map
 from catmaid.control.review import get_treenodes_to_reviews, \
         get_treenodes_to_reviews_with_time
 
@@ -107,6 +109,8 @@ def compact_skeleton(request, project_id=None, skeleton_id=None, with_connectors
 
     if 0 != with_connectors:
         # Fetch all connectors with their partner treenode IDs
+        pre = relations['presynaptic_to']
+        post = relations['postsynaptic_to']
         cursor.execute('''
             SELECT tc.treenode_id, tc.connector_id, tc.relation_id,
                    c.location_x, c.location_y, c.location_z
@@ -114,9 +118,9 @@ def compact_skeleton(request, project_id=None, skeleton_id=None, with_connectors
                  connector c
             WHERE tc.skeleton_id = %s
               AND tc.connector_id = c.id
-        ''' % skeleton_id)
+              AND (tc.relation_id = %s OR tc.relation_id = %s)
+        ''' % (skeleton_id, pre, post))
 
-        post = relations['postsynaptic_to']
         connectors = tuple((row[0], row[1], 1 if row[2] == post else 0, row[3], row[4], row[5]) for row in cursor.fetchall())
 
     if 0 != with_tags:
@@ -149,12 +153,14 @@ def compact_arbor(request, project_id=None, skeleton_id=None, with_nodes=None, w
     The difference between this function and the compact_skeleton function is that
     the connectors contain the whole chain from the skeleton of interest to the
     partner skeleton:
-    [treenode_id, confidence, relation_id
+    [treenode_id, confidence,
      connector_id,
-     relation_id, confidence, treenode_id, skeleton_id]
-    where the last 4 values correspond to the partner skeleton.
-    Notice that the index in the array correponds to the position in the chain:
-    (skeleton ->) treenode -> confidence -> relation -> connector -> relation -> confidence -> treenode -> skeleton.
+     confidence, treenode_id, skeleton_id,
+     relation_id, relation_id]
+    where the first 2 values are from the given skeleton_id,
+    then the connector_id,
+    then the next 3 values are from the partner skeleton,
+    and finally the two relations: first for the given skeleton_id and then for the other skeleton.
     The relation_id is 0 for pre and 1 for post.
     """
 
@@ -257,7 +263,7 @@ def compact_arbor_with_minutes(request, project_id=None, skeleton_id=None, with_
     return r
 
 
-# THIS FUNCTION IS HEREBY DECLARED A MESS. Users of this function: split it up
+# DEPRECATED. Will be removed.
 def _skeleton_for_3d_viewer(skeleton_id, project_id, with_connectors=True, lean=0, all_field=False):
     """ with_connectors: when False, connectors are not returned
         lean: when not zero, both connectors and tags are returned as empty arrays. """
@@ -353,11 +359,12 @@ def _skeleton_for_3d_viewer(skeleton_id, project_id, with_connectors=True, lean=
     return name, nodes, tags, connectors, reviews
 
 
-
+# DEPRECATED. Will be removed.
 @requires_user_role([UserRole.Annotate, UserRole.Browse])
 def skeleton_for_3d_viewer(request, project_id=None, skeleton_id=None):
     return HttpResponse(json.dumps(_skeleton_for_3d_viewer(skeleton_id, project_id, with_connectors=request.POST.get('with_connectors', True), lean=int(request.POST.get('lean', 0)), all_field=request.POST.get('all_fields', False)), separators=(',', ':')))
 
+# DEPRECATED. Will be removed.
 @requires_user_role([UserRole.Annotate, UserRole.Browse])
 def skeleton_with_metadata(request, project_id=None, skeleton_id=None):
 
@@ -570,13 +577,7 @@ def skeletons_neuroml(request, project_id=None):
 
     cursor = connection.cursor()
 
-    cursor.execute('''
-    SELECT relation_name, id
-    FROM relation
-    WHERE project_id = %s
-      AND (relation_name = 'presynaptic_to' OR relation_name = 'postsynaptic_to')
-    ''' % project_id)
-    relations = dict(cursor.fetchall())
+    relations = get_relation_to_id_map(project_id, ('presynaptic_to', 'postsynaptic_to'), cursor)
     preID = relations['presynaptic_to']
     postID = relations['postsynaptic_to']
 
@@ -600,15 +601,7 @@ def export_neuroml_level3_v181(request, project_id=None):
     skeleton_strings = ",".join(map(str, skeleton_ids))
     cursor = connection.cursor()
 
-    cursor.execute('''
-    SELECT relation_name, id
-    FROM relation
-    WHERE project_id = %s
-      AND (relation_name = 'presynaptic_to'
-           OR relation_name = 'postsynaptic_to')
-    ''' % int(project_id))
-
-    relations = dict(cursor.fetchall())
+    relations = get_relation_to_id_map(project_id, ('presynaptic_to', 'postsynaptic_to'), cursor)
     presynaptic_to = relations['presynaptic_to']
     postsynaptic_to = relations['postsynaptic_to']
 
@@ -638,7 +631,8 @@ def export_neuroml_level3_v181(request, project_id=None):
         SELECT treenode_id, connector_id, relation_id, skeleton_id
         FROM treenode_connector
         WHERE skeleton_id IN (%s)
-        ''' % skeleton_strings)
+          AND (relation_id = %s OR relation_id = %s)
+        ''' % (skeleton_strings, presynaptic_to, postsynaptic_to))
 
         # Dictionary of connector ID vs map of relation_id vs list of treenode IDs
         connectors = defaultdict(partial(defaultdict, list))
@@ -697,7 +691,7 @@ def export_neuroml_level3_v181(request, project_id=None):
     return response
 
 
-@requires_user_role([UserRole.Annotate, UserRole.Browse])
+@requires_user_role(UserRole.Browse)
 def skeleton_swc(*args, **kwargs):
     kwargs['format'] = 'swc'
     return export_skeleton_response(*args, **kwargs)
@@ -714,7 +708,7 @@ def _export_review_skeleton(project_id=None, skeleton_id=None, format=None,
     treenodes = Treenode.objects.filter(skeleton_id=skeleton_id).values_list(
         'id', 'parent_id', 'location_x', 'location_y', 'location_z')
     # Get all reviews for the requested skeleton
-    reviews = get_treenodes_to_reviews(skeleton_ids=[skeleton_id])
+    reviews = get_treenodes_to_reviews_with_time(skeleton_ids=[skeleton_id])
 
     # Add each treenode to a networkx graph and attach reviewer information to
     # it.
@@ -783,7 +777,7 @@ def _export_review_skeleton(project_id=None, skeleton_id=None, format=None,
         })
     return segments
 
-@requires_user_role([UserRole.Annotate, UserRole.Browse])
+@requires_user_role(UserRole.Browse)
 def export_review_skeleton(request, project_id=None, skeleton_id=None, format=None):
     """
     Export the skeleton as a list of sequences of entries, each entry containing
@@ -796,19 +790,19 @@ def export_review_skeleton(request, project_id=None, skeleton_id=None, format=No
 
     segments = _export_review_skeleton( project_id, skeleton_id, format,
             subarbor_node_id )
-    return HttpResponse(json.dumps(segments))
+    return HttpResponse(json.dumps(segments, cls=DjangoJSONEncoder),
+            content_type='text/json')
 
-@requires_user_role([UserRole.Annotate, UserRole.Browse])
+@requires_user_role(UserRole.Browse)
 def skeleton_connectors_by_partner(request, project_id):
     """ Return a dict of requested skeleton vs relation vs partner skeleton vs list of connectors.
     Connectors lacking a skeleton partner will of course not be included. """
     skeleton_ids = set(int(v) for k,v in request.POST.iteritems() if k.startswith('skids['))
     cursor = connection.cursor()
 
-    cursor.execute('''
-    SELECT id, relation_name FROM relation WHERE relation_name = 'postsynaptic_to' OR relation_name = 'presynaptic_to'
-    ''')
-    relations = dict(cursor.fetchall())
+    relations = get_relation_to_id_map(project_id, ('presynaptic_to', 'postsynaptic_to'), cursor)
+    pre = relations['presynaptic_to']
+    post = relations['postsynaptic_to']
 
     cursor.execute('''
     SELECT tc1.skeleton_id, tc1.relation_id,
@@ -819,7 +813,9 @@ def skeleton_connectors_by_partner(request, project_id):
       AND tc1.connector_id = tc2.connector_id
       AND tc1.skeleton_id != tc2.skeleton_id
       AND tc1.relation_id != tc2.relation_id
-    ''' % ','.join(map(str, skeleton_ids)))
+      AND (tc1.relation_id = %s OR tc1.relation_id = %s)
+      AND (tc2.relation_id = %s OR tc2.relation_id = %s)
+    ''' % (','.join(map(str, skeleton_ids)), pre, post, pre, post))
 
     # Dict of skeleton vs relation vs skeleton vs list of connectors
     partners = defaultdict(partial(defaultdict, partial(defaultdict, list)))
@@ -830,13 +826,110 @@ def skeleton_connectors_by_partner(request, project_id):
     return HttpResponse(json.dumps(partners))
 
 
-@requires_user_role([UserRole.Annotate, UserRole.Browse])
+@requires_user_role(UserRole.Browse)
 def export_skeleton_reviews(request, project_id=None, skeleton_id=None):
     """ Return a map of treenode ID vs list of reviewer IDs,
     without including any unreviewed treenode. """
     m = defaultdict(list)
-    for row in Review.objects.filter(skeleton_id=int(skeleton_id)).values_list('treenode_id', 'reviewer_id').iterator():
-        m[row[0]].append(row[1])
+    for row in Review.objects.filter(skeleton_id=int(skeleton_id)).values_list('treenode_id', 'reviewer_id', 'review_time').iterator():
+        m[row[0]].append(row[1:3])
 
-    return HttpResponse(json.dumps(m, separators=(',', ':')))
+    return HttpResponse(json.dumps(m, separators=(',', ':'), cls=DjangoJSONEncoder))
+
+@requires_user_role(UserRole.Browse)
+def within_spatial_distance(request, project_id=None):
+    """ Find skeletons within a given Euclidean distance of a treenode. """
+    project_id = int(project_id)
+    tnid = request.POST.get('treenode', None)
+    if not tnid:
+        raise Exception("Need a treenode!")
+    tnid = int(tnid)
+    distance = int(request.POST.get('distance', 0))
+    if 0 == distance:
+        return HttpResponse(json.dumps({"skeletons": []}))
+    size_mode = int(request.POST.get("size_mode", 0))
+    having = ""
+
+    if 0 == size_mode:
+        having = "HAVING count(*) > 1"
+    elif 1 == size_mode:
+        having = "HAVING count(*) = 1"
+    # else, no constraint
+
+    cursor = connection.cursor()
+    cursor.execute('SELECT location_x, location_y, location_z FROM treenode WHERE id=%s' % tnid)
+    pos = cursor.fetchone()
+
+    limit = 100
+    x0 = pos[0] - distance
+    x1 = pos[0] + distance
+    y0 = pos[1] - distance
+    y1 = pos[1] + distance
+    z0 = pos[2] - distance
+    z1 = pos[2] + distance
+
+    # Cheap emulation of the distance
+    cursor.execute('''
+SELECT skeleton_id, count(*)
+FROM treenode
+WHERE project_id = %s
+  AND location_x > %s
+  AND location_x < %s
+  AND location_y > %s
+  AND location_y < %s
+  AND location_z > %s
+  AND location_z < %s
+GROUP BY skeleton_id
+%s
+LIMIT %s
+''' % (project_id, x0, x1, y0, y1, z0, z1, having, limit))
+
+
+    skeletons = tuple(row[0] for row in cursor.fetchall())
+
+    return HttpResponse(json.dumps({"skeletons": skeletons,
+                                    "reached_limit": 100 == len(skeletons)}))
+
+@requires_user_role(UserRole.Browse)
+def partners_by_connector(request, project_id=None):
+    """ Return a list of skeleton IDs related to the given list of connector IDs of the given skeleton ID.
+    Will optionally filter for only presynaptic (relation=0) or only postsynaptic (relation=1). """
+    skid = request.POST.get('skid', None)
+    if not skid:
+        raise Exception("Need a reference skeleton ID!")
+    skid = int(skid)
+    connectors = tuple(int(v) for k,v in request.POST.iteritems() if k.startswith('connectors['))
+    rel_type = int(request.POST.get("relation", 0))
+    size_mode = int(request.POST.get("size_mode", 0))
+
+    query = '''
+SELECT DISTINCT tc2.skeleton_id
+FROM treenode_connector tc1,
+     treenode_connector tc2
+WHERE tc1.project_id = %s
+  AND tc1.skeleton_id = %s
+  AND tc1.connector_id = tc2.connector_id
+  AND tc1.skeleton_id != tc2.skeleton_id
+  AND tc1.relation_id != tc2.relation_id
+  AND tc1.connector_id IN (%s)
+''' % (project_id, skid, ",".join(str(x) for x in connectors))
+
+    # Constrain the relation of the second part
+    if 0 == rel_type or 1 == rel_type:
+        query += "AND tc2.relation_id = (SELECT id FROM relation WHERE project_id = %s AND relation_name = '%s')" % (project_id, 'presynaptic_to' if 1 == rel_type else 'postsynaptic_to')
+
+    cursor = connection.cursor()
+    cursor.execute(query)
+
+    if 0 == size_mode or 1 == size_mode:
+        # Filter by size: only those with more than one treenode or with exactly one
+        cursor.execute('''
+SELECT skeleton_id
+FROM treenode
+WHERE skeleton_id IN (%s)
+GROUP BY skeleton_id
+HAVING count(*) %s 1
+''' % (",".join(str(row[0]) for row in cursor.fetchall()), ">" if 0 == size_mode else "="))
+
+    return HttpResponse(json.dumps(tuple(row[0] for row in cursor.fetchall())))
 

@@ -1,25 +1,17 @@
 div.sliceView
 {
 	position:relative;
-/*
-	margin:20px 20px 20px 200px;
-	width:100px;
-	height:100px;
-*/
 	margin:0px;
     sliceViewtop:0px;
 	right:0px;
 	bottom:0px;
 	left:0px;
 	padding:0px;
-	/*
-	background:#808080;
-	*/
 	background:#000000;
 	overflow:hidden;
 }
 
-div.sliceView div.sliceTiles
+div.sliceView .sliceTiles
 {
 	position:absolute;
 	top:0px;
@@ -38,10 +30,11 @@ div.sliceView div.sliceTiles img
 	margin:0px;
 	padding:0px;
 	transform:translateZ(0px);
-/*
-	width:256px;
-	height:256px;
-*/
+}
+
+div.sliceView div.sliceTiles.transpose img
+{
+	transform:rotate3d(1, 1, 0, 180deg);
 }
 
 div.smallMapView,
@@ -59,7 +52,7 @@ div.smallMapView_hidden
 	border-top:solid 4px #000000;
 	border-left:solid 4px #000000;
 	background:#000000;
-	z-index:4;
+	z-index:6;
 }
 div.smallMapView_hidden
 {
@@ -130,20 +123,108 @@ div.smallMapView_hidden div.smallMapRect div
 
 div.TilelayerControl
 {
-	/*border:solid 2px #0000FF;*/
-	margin:0px;
-	padding:0px;
+	border: solid 1px #00F;
+	margin: 0;
+	padding: 8px;
 	position:relative;
     top:10px;
     left:10px;
-    width:130px;
+    width: 40em;
+    min-width: 40%;
+    max-width: 80%;
+    height: 65%;
+    overflow-x: hidden;
+    overflow-y: auto;
     color:#FFFFFF;
+    background: #000;
+    opacity: 0.8;
+}
+
+div.TilelayerControl .setting
+{
+	float: none;
+}
+
+div.TilelayerControl ol
+{
+	list-style-type: none;
+	margin: 0;
+	padding: 1em 0;
+	clear: both;
 }
 
 div.TilelayerControl .layerControl
 {
-	/*border:solid 2px #0000FF;*/
-	margin:0 0 10px 0;
+	margin: 0 4px 6px 4px;
+	padding: 0.4em;
+	counter-increment: order-counter;
+}
+
+.layerControl.orderable
+{
+	background: #111;
+}
+
+li.layerControl::before
+{
+  content: counter(order-counter);
+  margin-right: 5px;
+  margin-top: 0.25em;
+  background-color: #ccc;
+  color: #000;
+  font-weight: bold;
+  padding: 3px 8px;
+  border-radius: 3px;
+  float: left;
+}
+
+div.TilelayerControl h4
+{
+	margin: 0.5em 0;
+}
+
+div.TilelayerControl .layerClose
+{
+	float: right;
+	margin: 0.3em;
+	cursor: pointer;
+}
+
+.layerControl .setting
+{
+	float: none;
+	margin: 0.5em 0;
+}
+
+div.TilelayerControl .hSliderView
+{
+	float: none;
+	display: inline-block;
+	vertical-align: middle;
+}
+
+li.layerControl ol
+{
+	margin-left: 3em;
+	padding: 0 1em;
+	list-style-type: decimal;
+}
+
+div.TilelayerControl li.highlight
+{
+	min-height: 1em;
+	border: solid 1px #00F;
+}
+
+.layerControl .layerFilterControl input.remove
+{
+	position: absolute;
+	left: 0.5em;
+}
+
+.layerControl .layerFilterControl h5
+{
+	margin: 0;
 }
 
 div.stackControlToggle,

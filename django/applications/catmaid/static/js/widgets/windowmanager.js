@@ -2,7 +2,6 @@
  * windowmanager.js
  *
  * requirements:
- *   ui.js
  *   resize_handle.js
  *
  * Tiled window manager for frame-like Javascript-`windows'.
@@ -125,8 +124,8 @@ function CMWRootNode()
 
 	this.getChildren = function()
 	{
-		var children = new Array();
-		if ( child != null ) 
+		var children = [];
+		if ( child !== null )
 		{
 			children.push( child );
 			children = children.concat( child.getChildren() );
@@ -136,7 +135,7 @@ function CMWRootNode()
 
 	this.getWindows = function()
 	{
-		if ( child != null )
+		if ( child !== null )
 			return child.getWindows();
 		else	
 			return [];
@@ -175,16 +174,16 @@ function CMWRootNode()
 
 	this.catchDrag = function()
 	{
-		ui.catchFocus();
-		ui.registerEvent( "onmouseup", self.releaseDrag );
-		ui.catchEvents();
+		CATMAID.ui.catchFocus();
+		CATMAID.ui.registerEvent( "onmouseup", self.releaseDrag );
+		CATMAID.ui.catchEvents();
 		child.catchDrag();
 	};
 	
 	this.releaseDrag = function()
 	{
-		ui.releaseEvents();
-		ui.removeEvent( "onmouseup", self.releaseDrag );
+		CATMAID.ui.releaseEvents();
+		CATMAID.ui.removeEvent( "onmouseup", self.releaseDrag );
 		child.releaseDrag();
 	};
 	
@@ -367,7 +366,7 @@ function CMWHSplitNode( child1, child2 )
 	{
 		var oldChild = child1;
 		self.removeResizeHandle();
-		if ( newChild.getFrame().parentNode != null )
+		if ( newChild.getFrame().parentNode !== null )
 			newChild.getFrame().parentNode.removeChild( newChild.getFrame() );
 		newChild.getFrame().appendChild( resizeHandle.getView() );
 		if ( child1.getFrame().parentNode == frame )
@@ -383,7 +382,7 @@ function CMWHSplitNode( child1, child2 )
 	this.replaceRightChild = function( newChild )
 	{
 		var oldChild = child2;
-		if ( newChild.getFrame().parentNode != null )
+		if ( newChild.getFrame().parentNode !== null )
 			newChild.getFrame().parentNode.removeChild( newChild.getFrame() );
 		if ( child2.getFrame().parentNode == frame )
 			frame.replaceChild( newChild.getFrame(), child2.getFrame() );
@@ -577,7 +576,7 @@ function CMWVSplitNode( child1, child2 )
 		var oldChild = child1;
 		self.removeResizeHandle();
 		var newChildFrame = newChild.getFrame();
-		if ( newChildFrame.parentNode != null )
+		if ( newChildFrame.parentNode !== null )
 			newChildFrame.parentNode.removeChild( newChildFrame );
 		newChildFrame.appendChild( resizeHandle.getView() );
 		if ( child1.getFrame().parentNode == frame )
@@ -593,7 +592,7 @@ function CMWVSplitNode( child1, child2 )
 	this.replaceBottomChild = function( newChild )
 	{
 		var oldChild = child2;
-		if ( newChild.getFrame().parentNode != null )
+		if ( newChild.getFrame().parentNode !== null )
 			newChild.getFrame().parentNode.removeChild( newChild.getFrame() );
 		if ( child2.getFrame().parentNode == frame )
 			frame.replaceChild( newChild.getFrame(), child2.getFrame() );
@@ -722,7 +721,9 @@ function CMWWindow( title )
 		for ( var i = 0; i < windows.length; ++i )
 		{
 			var w = windows[ i ];
-			if( w.hasFocus() )
+			// Unfocus other window, if it has focus. Don't unfocus this window, if
+			// focus is called multiple times.
+			if( w !== self && w.hasFocus() )
 			{
 				w.getFrame().firstChild.className = "stackInfo";
 				w.callListeners( CMWWindow.BLUR );
@@ -770,7 +771,7 @@ function CMWWindow( title )
 	eventCatcher.className = "eventCatcher";
 	frame.appendChild( eventCatcher );
 	
-	var listeners = new Array();
+	var listeners = [];
 	
 	this.catchDrag = function()
 	{
@@ -785,6 +786,11 @@ function CMWWindow( title )
 	};
 	
 	frame.onmousedown = this.focus;
+
+	frame.onmouseenter = function( e ) {
+		self.callListeners( CMWWindow.POINTER_ENTER );
+		return false;
+	};
 	
 	titleBar.onmousedown = function( e )
 	{
@@ -797,7 +803,7 @@ function CMWWindow( title )
 	{
 		if ( self != CMWWindow.selectedWindow ) 
 		{
-			var m = ui.getMouse(e, eventCatcher);
+			var m = CATMAID.ui.getMouse(e, eventCatcher);
 			var min = m.offsetY;
 			var s = "Top";
 			if ( m.offsetY > self.getHeight() / 2 ) 
@@ -974,12 +980,14 @@ CMWWindow.CLOSE = 0;
 CMWWindow.RESIZE = 1;
 CMWWindow.FOCUS = 2;
 CMWWindow.BLUR = 3;
+CMWWindow.POINTER_ENTER = 4;
 
 CMWWindow.signalName = {};
 CMWWindow.signalName[CMWWindow.CLOSE] = 'CLOSE';
 CMWWindow.signalName[CMWWindow.RESIZE] = 'RESIZE';
 CMWWindow.signalName[CMWWindow.FOCUS] = 'FOCUS';
 CMWWindow.signalName[CMWWindow.BLUR] = 'BLUR';
+CMWWindow.signalName[CMWWindow.POINTER_ENTER] = 'POINTER_ENTER';
 
 
 /**
@@ -995,45 +1003,46 @@ function ResizeHandle(type, node) {
 
   var onmousemove = {
     h: function (e) {
-      node.changeWidth( ui.diffX );
+      node.changeWidth( CATMAID.ui.diffX );
       return false;
     },
     v: function (e) {
-      node.changeHeight( ui.diffY );
+      node.changeHeight( CATMAID.ui.diffY );
       return false;
     }
   };
 
   var onmouseup = {
     h: function (e) {
-      ui.releaseEvents();
-      ui.removeEvent("onmousemove", onmousemove.h);
-      ui.removeEvent("onmouseup", onmouseup.h);
+      CATMAID.ui.releaseEvents();
+      CATMAID.ui.removeEvent("onmousemove", onmousemove.h);
+      CATMAID.ui.removeEvent("onmouseup", onmouseup.h);
       return false;
     },
     v: function (e) {
-      ui.releaseEvents();
-      ui.removeEvent("onmousemove", onmousemove.v);
-      ui.removeEvent("onmouseup", onmouseup.v);
+      CATMAID.ui.releaseEvents();
+      CATMAID.ui.removeEvent("onmousemove", onmousemove.v);
+      CATMAID.ui.removeEvent("onmouseup", onmouseup.v);
       return false;
     }
   };
 
   var onmousedown = {
     h: function (e) {
-      ui.registerEvent("onmousemove", onmousemove.h);
-      ui.registerEvent("onmouseup", onmouseup.h);
-      ui.catchEvents("e-resize");
-      ui.onmousedown(e);
-      ui.catchFocus();
+      CATMAID.ui.registerEvent("onmousemove", onmousemove.h);
+      CATMAID.ui.registerEvent("onmouseup", onmouseup.h);
+      CATMAID.ui.catchEvents("e-resize");
+      CATMAID.ui.onmousedown(e);
+      CATMAID.ui.catchFocus();
 
       return false;
     },
     v: function (e) {
-      ui.registerEvent("onmousemove", onmousemove.v);
-      ui.registerEvent("onmouseup", onmouseup.v);
-      ui.catchEvents("s-resize");
-      ui.catchFocus();
+      CATMAID.ui.registerEvent("onmousemove", onmousemove.v);
+      CATMAID.ui.registerEvent("onmouseup", onmouseup.v);
+      CATMAID.ui.catchEvents("s-resize");
+      CATMAID.ui.onmousedown(e);
+      CATMAID.ui.catchFocus();
 
       return false;
     }
@@ -1041,8 +1050,6 @@ function ResizeHandle(type, node) {
 
 
   // initialise
-  if (typeof ui === "undefined") ui = new UI();
-
   var self = this;
 
   if (type != "v") type = "h";
@@ -1050,4 +1057,4 @@ function ResizeHandle(type, node) {
   view.className = "resize_handle_" + type;
   view.onmousedown = onmousedown[type];
   view.onmouseup = onmouseup[type];
-};
+}

@@ -1,5 +1,8 @@
 /* -*- mode: espresso; espresso-indent-level: 2; indent-tabs-mode: nil -*- */
 /* vim: set softtabstop=2 shiftwidth=2 tabstop=2 expandtab: */
+/* global
+  requestQueue
+  */
 
 /** The queue of submitted requests is reset if any returns an error.
  *  The returned function accepts null URL as argument, which signals
@@ -27,6 +30,8 @@
 var submitterFn = function() {
   // Accumulate invocations
   var queue = [];
+  // Store last result
+  var lastResult;
 
   var complete = function(q) {
     // Remove this call
@@ -39,18 +44,28 @@ var submitterFn = function() {
 
   var invoke = function(q, json) {
     try {
-      q.fn(json);
+      lastResult = q.fn ? q.fn(json) : json;
     } catch (e) {
       alert(e);
     } finally {
-      complete(q);
+      // If the result of the invocation is a promise (i.e. has a then()
+      // method), wait with completion for its fulfillment.
+      if (lastResult && typeof(lastResult.then) === "function") {
+        lastResult.then(function(result) {
+          // Make the result of the promise the new result
+          lastResult = result;
+          complete(q);
+        }, function(error) {
+          reset(q, error);
+        });
+      } else {
+        complete(q);
+      }
     }
   };
 
   var reset = function(q, error) {
     if (q.blockUI) $.unblockUI();
-    console.log(error, q);
-    if (error.error) new ErrorDialog(error.error, error.detail).show();
     // Collect all error callbacks from all queued items. The current item is
     // expected to be still the first element.
     var callbacks = queue.reduce(function(o, e) {
@@ -62,11 +77,34 @@ var submitterFn = function() {
 
     // Reset queue
     queue.length = 0;
+    // Reset result cache
+    lastResult = undefined;
 
     // Call all callbacks
-    callbacks.forEach(function(errCallback) {
-      errCallback();
-    });
+    var handled = false;
+    var callbackError;
+    try {
+      callbacks.forEach(function(errCallback, i) {
+        var result =  errCallback(error);
+        // The andler of the failed request, can mark this error as handled.
+        handled = (errCallback === q.errCallback) ? result : handled;
+      });
+    } catch (e) {
+     callbackError = e;
+    }
+
+    // If the error was handled, don't print console message or show a dialog.
+    if (!handled) {
+      console.log(error, q);
+      if (!q.quiet && error.error) {
+        CATMAID.error(error.error, error.detail);
+      }
+    }
+
+    // If there was an error in one of the callbacks, report this as well.
+    if (callbackError) {
+      CATMAID.error(callbackError);
+    }
   };
 
   var handlerFn = function(q) {
@@ -111,26 +149,40 @@ var submitterFn = function() {
 
     if (q.url) {
       if (q.replace) {
-        requestQueue.replace(q.url, "POST", q.post, handlerFn(q), q.url);
+        requestQueue.replace(q.url, "POST", q.post, handlerFn(q), q.id);
       } else {
         requestQueue.register(q.url, "POST", q.post, handlerFn(q));
       }
     } else {
-      // No url: direct execution with null json
-      invoke(q, null);
+      // No url: direct execution with last result
+      invoke(q, lastResult);
     }
   };
 
-  return function(url, post, fn, blockUI, replace, errCallback) {
+  var submit = function(url, post, fn, blockUI, replace, errCallback, quiet, id) {
     queue.push({url: url,
           post: post,
           fn: fn,
           blockUI: blockUI,
           replace: replace,
-          errCallback: errCallback});
+          errCallback: errCallback,
+          quiet: quiet,
+          id: id || url});
     // Invoke if the queue contains only the new entry
     if (1 === queue.length) {
       next();
     }
+    // Return self to allow chaining
+    return submit;
   };
+
+  /**
+   * Allow submitter to be used as a Promise.
+   */
+  submit.then = function(onResolve, onReject, blockUI) {
+    submit(null, null, onResolve, blockUI, false, onReject, false);
+    return submit;
+  };
+
+  return submit;
 };

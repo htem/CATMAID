@@ -63,7 +63,7 @@ SkeletonAnalytics.prototype.init = function() {
 	var getTable = this.getTable.bind(this);
 
 	/** Make rows double-clickable to go to the treenode location and select it. */
-	$("#skeletonanalyticstable" + this.widgetID + " tbody tr").live('dblclick', function () {
+	$("#skeletonanalyticstable" + this.widgetID + " tbody").on('dblclick', 'tr', function () {
 		var aData = getTable().fnGetData(this);
 		var tnid = parseInt(aData[2]);
 		var skeleton_id = parseInt(aData[3]);
@@ -92,9 +92,9 @@ SkeletonAnalytics.prototype.init = function() {
 };
 
 SkeletonAnalytics.prototype.loadData = function () {
-	var skids = SkeletonListSources.getSelectedSource(this).getSelectedSkeletons();
+	var skids = CATMAID.skeletonListSources.getSelectedSource(this).getSelectedSkeletons();
 	if (!skids || !skids[0]) {
-		growlAlert("Oops", "Select skeleton(s) first!");
+		CATMAID.msg("Oops", "Select skeleton(s) first!");
 		return;
 	}
 	var table = this.table;
@@ -103,7 +103,7 @@ SkeletonAnalytics.prototype.loadData = function () {
 		{skeleton_ids: skids,
 		 extra: $('#skeleton_analytics_extra' + this.widgetID).val(),
 		 adjacents: $('#skeleton_analytics_adjacents' + this.widgetID).val()},
-		 jsonResponseHandler(function(json) {
+		 CATMAID.jsonResponseHandler(function(json) {
 			var rows = [];
 			json.issues.forEach(function (sk) {
 				// sk[0]: skeleton ID
