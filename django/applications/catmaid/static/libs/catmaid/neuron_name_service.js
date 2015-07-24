@@ -1,10 +1,17 @@
+/* global
+  project,
+  requestQueue,
+  session
+  */
+
 "use strict";
 
 /**
  * The neuron name service is a singlton that creates a name for a specific
  * neuron. Based on the user's settings, the name is the regular neuron name or
- * based on annotations.  It can be configured with the help of the settings
- * widget.
+ * based on annotations.It can be configured with the help of the settings
+ * widget. All potentially asynchronous methods return a promise that is
+ * resolved once the asynchronous action is complete.
  */
 var NeuronNameService = (function()
 {
@@ -12,9 +19,10 @@ var NeuronNameService = (function()
   var instance;
 
   /**
-   * Creates a new instance of the neuron name service.
+   * Creates a new instance of the neuron name service. If empty is true, the
+   * fallback list is empty.
    */
-  function init() {
+  function init(empty) {
     // All available naming options. If an entry needs a parameter and includes
     // the pattern "..." in its name, this pattern will be replaced by the
     // parameter when added to the actual fallback list.
@@ -28,7 +36,7 @@ var NeuronNameService = (function()
     ];
 
     // The current fallback/naming list
-    var fallbackList = [
+    var fallbackList = empty ? [] : [
       {id: 'skeletonid', name: "Skeleton ID"},
       {id: 'neuronname', name: "Neuron name"}
     ];
@@ -55,6 +63,15 @@ var NeuronNameService = (function()
 
         // Update the name representation of all neurons
         this.refresh();
+      },
+
+      /**
+       * Return true if the skeleton ID is appended to every label, false
+       * otherwise.
+       */
+      getAppendSkeletonId: function()
+      {
+        return appendSkeletonId;
       },
 
       /**
@@ -134,24 +151,41 @@ var NeuronNameService = (function()
       /**
        * Convenience method to make a single skeleton model known to the naming
        * service and to register the given client as linked to it.
+       *
+       * @returns a promise that will be resolved once registering is finished.
        */
       register: function(client, model, callback)
       {
         var models = {};
         models[model.id] = model;
-        this.registerAll(client, models, callback);
+        return this.registerAll(client, models, callback);
       },
 
       /**
        * Makes all given skeletons known to the naming service and registers the
        * given client as linked to these skeletons.
+       *
+       * @returns a promise that will be resolved once registering is finished.
        */
       registerAll: function(client, models, callback)
       {
+        if (!client) {
+          throw new CATMAID.ValueError("Please provide a valid client");
+        }
+
+        // Make sure all skeletons have valid integer IDs.
+        var validIDs = [];
+        for (var skid in models) {
+          var id = parseInt(skid, 10);
+          if (!id) throw new CATMAID.ValueError("Please provide valid IDs");
+          else validIDs.push(id);
+        }
+
         // Link all skeleton IDs to the client and create a list of unknown
         // skeletons.
         var unknownSkids = [];
-        for (var skid in models) {
+        for (var i=0; i<validIDs.length; ++i) {
+          var skid = validIDs[i];
           if (skid in managedSkeletons) {
             if (-1 === managedSkeletons[skid].clients.indexOf(client)) {
               managedSkeletons[skid].clients.push(client);
@@ -173,9 +207,15 @@ var NeuronNameService = (function()
 
         if (0 === unknownSkids.length) {
           // Execute callback and return if there aren't any unknown skeleton ID
-          if (callback) callback();
+          return new Promise(function(resolve, reject) {
+            resolve();
+            if (callback) {
+                callback();
+            }
+          });
         } else {
-          this.updateNames(unknownSkids, callback);
+          return this.updateNames(unknownSkids, callback)
+            .then(this.notifyClients.bind(this));
         }
       },
 
@@ -223,13 +263,32 @@ var NeuronNameService = (function()
       },
 
       /**
+       * Unregister a list of skeletons from all clients that reference it. This
+       * is used for instance to unregister deleted neurons.
+       */
+      unregisterFromAllClients: function(skids)
+      {
+        clients.forEach(function(c) {
+          this.unregister(c, skids);
+        }, this);
+      },
+
+      /**
+       * Unregisters a single neuron from all clients that reference it.
+       */
+      unregisterSingleFromAllClients: function(skid)
+      {
+        this.unregisterFromAllClients([skid]);
+      },
+
+      /**
        * Tries to let every registered client know that there was an update in the
        * name representation.
        */
       notifyClients: function() {
         clients.forEach(function(c) {
           // If a client has a method called 'updateNeuronNames', call it
-          if (c.updateNeuronNames) {
+          if (c && c.updateNeuronNames) {
             c.updateNeuronNames();
           }
         });
@@ -238,10 +297,12 @@ var NeuronNameService = (function()
       /**
        * Updates the name representation of every managed neuron and notifies all
        * clients about it.
+       *
+       * @returns a promise that is resolved once the refresh is complete
        */
       refresh: function(callback)
       {
-        this.updateNames(null, (function() {
+        return this.updateNames(null, (function() {
           this.notifyClients();
           if (callback) {
             callback();
@@ -253,13 +314,15 @@ var NeuronNameService = (function()
        * Updates the name of all known skeletons, if no list of skeleton IDs is
        * passed.  Otherwise, only the given skeletons will be updated. Can execute a
        * callback, when the names were successfully updated.
+       *
+       * @returns a promise that is resolved once the update is complete
        */
       updateNames: function(skids, callback)
       {
         /**
          * The actual update function---see below for call.
          */
-        var update = function(data) {
+        var update = function(data, resolve, reject) {
           var name = function(skid) {
             /**
              * Support function to creat a label, based on meta annotations. Id a
@@ -344,23 +407,30 @@ var NeuronNameService = (function()
               }
             }
 
-            // Return the skeleton ID as last option
-            return "" + skid;
+            // Return null if no valid skeleton name could be found
+            return null;
           };
 
           if (skids) {
             skids.forEach(function(skid) {
-              managedSkeletons[skid].name = name(skid) +
-                   (appendSkeletonId ? " #" + skid : "");
+              // Ignore unknown skeletons
+              if (!managedSkeletons[skid]) {
+                return;
+              }
+              var n = name(skid);
+              if (appendSkeletonId) { n += " #" + skid; }
+              managedSkeletons[skid].name = n;
             });
           } else {
             for (var skid in managedSkeletons) {
-              managedSkeletons[skid].name = name(skid) +
-                   (appendSkeletonId ? " #" + skid : "");
+              var n = name(skid);
+              if (appendSkeletonId) { n += " #" + skid; }
+              managedSkeletons[skid].name = n;
             }
           }
 
-          // Execute callback, if available
+          // Resolve the promisme  and execute callback, if any
+          resolve();
           if (callback) {
             callback();
           }
@@ -371,32 +441,34 @@ var NeuronNameService = (function()
             return 'skeletonid' !== l.id;
         }).length;
 
-        if (needsNoBackend) {
-          // If no back-end is needed, call the update method right away, without
-          // any data.
-          update(null);
-        } else {
-          // Check if we need meta annotations
-          var needsMetaAnnotations = fallbackList.some(function(l) {
-              return 'all-meta' ===  l.id || 'own-meta' === l.id;
-          });
-          // Check if we need neuron names
-          var needsNeueonNames = fallbackList.some(function(l) {
-              return 'neuronname' === l.id;
-          });
+        return new Promise(function(resolve, reject) {
+          if (needsNoBackend || (!skids && !Object.keys(managedSkeletons).length)) {
+            // If no back-end is needed, call the update method right away, without
+            // any data.
+            update(null, resolve, reject);
+          } else {
+            // Check if we need meta annotations
+            var needsMetaAnnotations = fallbackList.some(function(l) {
+                return 'all-meta' ===  l.id || 'own-meta' === l.id;
+            });
+            // Check if we need neuron names
+            var needsNeueonNames = fallbackList.some(function(l) {
+                return 'neuronname' === l.id;
+            });
 
-          // Get all data that is needed for the fallback list
-          requestQueue.register(django_url + project.id + '/skeleton/annotationlist',
-            'POST',
-            {
-              skeleton_ids: Object.keys(managedSkeletons),
-              metaannotations: needsMetaAnnotations ? 1 : 0,
-              neuronnames: needsNeueonNames ? 1 : 0,
-            },
-            jsonResponseHandler(function(json) {
-              update(json);
-            }));
-        }
+            // Get all data that is needed for the fallback list
+            requestQueue.register(django_url + project.id + '/skeleton/annotationlist',
+              'POST',
+              {
+                skeleton_ids: Object.keys(managedSkeletons),
+                metaannotations: needsMetaAnnotations ? 1 : 0,
+                neuronnames: needsNeueonNames ? 1 : 0,
+              },
+              CATMAID.jsonResponseHandler(function(json) {
+                update(json, resolve, reject);
+              }, reject));
+          }
+        });
       },
 
       /**
@@ -427,7 +499,7 @@ var NeuronNameService = (function()
            classname: "neuron",
            pid: project.id
           },
-          jsonResponseHandler((function(data) {
+          CATMAID.jsonResponseHandler((function(data) {
             // Update all skeletons of the current neuron that are managed
             var updatedSkeletons = skeletonIds.filter(function(skid) {
               if (skid in managedSkeletons) {
@@ -450,6 +522,23 @@ var NeuronNameService = (function()
               }
             }
           }).bind(this)));
+      },
+
+      /**
+       * Listen to the neuron controller's delete event and remove neurons
+       * automatically from the name service.
+       */
+      registerEventHandlers: function() {
+        CATMAID.neuronController.on(CATMAID.neuronController.EVENT_SKELETON_DELETED,
+            this.unregisterSingleFromAllClients, instance);
+      },
+
+      /**
+       * Unregister from the neuron controller's delete event.
+       */
+      unregisterEventHandlers: function() {
+        CATMAID.neuronController.off(CATMAID.neuronController.EVENT_SKELETON_DELETED,
+            this.unregisterSingleFromAllClients, instance);
       }
     };
   }
@@ -458,9 +547,18 @@ var NeuronNameService = (function()
     getInstance: function() {
       if (!instance) {
         instance = init();
+        instance.registerEventHandlers();
       }
 
       return instance;
-    }
+    },
+
+    /**
+     * Crate a new name service instance which is independent from the
+     * singleton.
+     */
+    newInstance: function(empty) {
+      return init(empty);
+    },
   };
 })();

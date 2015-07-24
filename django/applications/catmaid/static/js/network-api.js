@@ -102,7 +102,7 @@ var CM = function()
       /*
       // Select the tracing tool if not selected
       if ("tracingtool" !== project.getTool().toolname) {
-        project.setTool( new TracingTool() );
+        project.setTool( new CATMAID.TracingTool() );
         // TODO synchronously wait for the tool to repaint
       }
       // Set this node as selected if not selected already
@@ -202,7 +202,7 @@ var CM = function()
      */
     var flattenValueArraysById = function(map) {
       var m = {};
-      var arr = new Array();
+      var arr = [];
       for (var ID in map) {
         if (map.hasOwnProperty(ID)) {
           for (var k in Object.keys(map[ID])) {

@@ -19,39 +19,39 @@ function CroppingTool() {
 	var self = this;
 	this.toolname = "croppingtool";
 
-	this.slider_crop_top_z = new Slider(
-			SLIDER_HORIZONTAL,
+	this.slider_crop_top_z = new CATMAID.Slider(
+			CATMAID.Slider.HORIZONTAL,
 			true,
 			1,
 			1,
 			1,
 			1,
-			function( val ){ statusBar.replaceLast( "crop top z: " + val ); return; } );
+			function( val ){ CATMAID.statusBar.replaceLast( "crop top z: " + val ); return; } );
 
-	this.slider_crop_bottom_z = new Slider(
-			SLIDER_HORIZONTAL,
+	this.slider_crop_bottom_z = new CATMAID.Slider(
+			CATMAID.Slider.HORIZONTAL,
 			true,
 			1,
 			1,
 			1,
 			1,
-			function( val ){ statusBar.replaceLast( "crop bottom z: " + val ); return; } );
+			function( val ){ CATMAID.statusBar.replaceLast( "crop bottom z: " + val ); return; } );
 
-	this.slider_crop_s = new Slider(
-			SLIDER_HORIZONTAL,
+	this.slider_crop_s = new CATMAID.Slider(
+			CATMAID.Slider.HORIZONTAL,
 			true,
 			5,
 			0,
 			6,
 			5,
-			function( val ){ statusBar.replaceLast( "crop s: " + val ); } );
+			function( val ){ CATMAID.statusBar.replaceLast( "crop s: " + val ); } );
 
 	// Obtain a reference to the RoiTool toolbar button
 	var toolbar = document.getElementById("toolbar_roi");
 	var toolbar_button = document.getElementById("button_roi_apply").parentNode;
 
 	// Keep a list of added elements
-	var added_elements = new Array();
+	var added_elements = [];
 
 	// A procedure to create a toolbar box
 	var create_tb_box = function()
@@ -157,7 +157,7 @@ function CroppingTool() {
 
 		var zoom_level = self.slider_crop_s.val;
 		var scale = 1 / Math.pow( 2, zoom_level );
-		var stack = self.stack;
+		var stack = self.stackViewer.primaryStack;
 		var cb = self.getCropBox();
 		var numSections = Math.max( self.slider_crop_top_z.val, self.slider_crop_bottom_z.val ) - Math.min( self.slider_crop_top_z.val, self.slider_crop_bottom_z.val ) + 1;
 		var pixelWidth = Math.round( ( Math.max( cb.left, cb.right ) - Math.min( cb.left, cb.right ) ) / stack.resolution.x * scale );
@@ -209,7 +209,7 @@ function CroppingTool() {
 			}
 			else
 			{
-				statusBar.replaceLast( text );
+				CATMAID.statusBar.replaceLast( text );
 				alert( "Cropping the microstack...\nThis operation may take some time, you will be notified as soon as the cropped stack is ready." );
 			}
 		} else {
@@ -228,7 +228,7 @@ function CroppingTool() {
 		// only create and show the menu when there is more than one stack
 		if (self.stacks_to_crop.length > 1)
 		{
-			var current_menu_content = new Array();
+			var current_menu_content = [];
 			for (var s in self.stacks_to_crop)
 			{
 				var stack = self.stacks_to_crop[ s ];
@@ -300,7 +300,7 @@ function CroppingTool() {
 
 	this.changeSlice = function( val )
 	{
-		self.stack.moveToPixel( val, self.stack.y, self.stack.x, self.stack.s );
+		self.stackViewer.moveToPixel( val, self.stackViewer.y, self.stackViewer.x, self.stackViewer.s );
 		return;
 	};
 
@@ -335,7 +335,7 @@ function CroppingTool() {
 		//self.stack.moveToPixel( self.stack.z, self.stack.y, self.stack.x, val );
 		if ( self.getCropBox() )
 			self.updateCropBox();
-		statusBar.replaceLast( "crop s: " + val );
+		CATMAID.statusBar.replaceLast( "crop s: " + val );
 		self.zoomlevel = val;
 		return;
 	};
@@ -345,43 +345,43 @@ function CroppingTool() {
 	 * the same position in the view
 	 */
 	this.scalePreservingLastPosition = function (keep_x, keep_y, sp) {
-		var old_s = self.stack.s;
-		var old_scale = self.stack.scale;
-		var new_s = Math.max(0, Math.min(self.stack.MAX_S, Math.round(sp)));
+		var old_s = self.stackViewer.s;
+		var old_scale = self.stackViewer.scale;
+		var new_s = Math.max(0, Math.min(self.stackViewer.primaryStack.MAX_S, Math.round(sp)));
 		var new_scale = 1 / Math.pow(2, new_s);
 
 		if (old_s == new_s)
 			return;
 
-		var dx = keep_x - self.stack.getProject().coordinates.x;
-		var dy = keep_y - self.stack.getProject().coordinates.y;
+		var dx = keep_x - self.stackViewer.getProject().coordinates.x;
+		var dy = keep_y - self.stackViewer.getProject().coordinates.y;
 
 		var new_centre_x = keep_x - dx * (old_scale / new_scale);
 		var new_centre_y = keep_y - dy * (old_scale / new_scale);
 
-		self.stack.moveTo(self.stack.getProject().coordinates.z, new_centre_y, new_centre_x, sp);
+		self.stackViewer.moveTo(self.stackViewer.getProject().coordinates.z, new_centre_y, new_centre_x, sp);
 	};
 
 	//--------------------------------------------------------------------------
 
 	/**
-	 * install this tool in a stack.
+	 * install this tool in a stack viewer.
 	 * register all GUI control elements and event handlers
 	 */
-	this.register = function( parentStack )
+	this.register = function( parentStackViewer )
 	{
 		// call register of super class (updates also stack member)
-		CroppingTool.superproto.register.call( self, parentStack );
+		CroppingTool.superproto.register.call( self, parentStackViewer );
 
 		// initialize the stacks we offer to crop
 		getStackMenuInfo(project.id, function(stacks) {
-			self.stacks_to_crop = new Array();
+			self.stacks_to_crop = [];
 			$.each(stacks, function(index, value) {
 				// By default, mark only the current stack to be cropped
 				self.stacks_to_crop.push(
 					{
 						data : value,
-						marked : ( value.id == self.stack.getId() )
+						marked : ( value.id == self.stackViewer.primaryStack.id )
 					});
 			 });
 
@@ -391,10 +391,10 @@ function CroppingTool() {
 
 		document.getElementById( "edit_button_crop" ).className = "button_active";
 
-		self.stack.getView().appendChild( self.mouseCatcher );
+		self.stackViewer.getView().appendChild( self.mouseCatcher );
 
 		// initialize top and bottom z-index slider
-		if ( self.stack.slices.length < 2 )	//!< hide the self.slider_z if there is only one slice
+		if ( self.stackViewer.primaryStack.slices.length < 2 )	//!< hide the self.slider_z if there is only one slice
 		{
 			self.slider_crop_top_z.getView().parentNode.style.display = "none";
 			self.slider_crop_bottom_z.getView().parentNode.style.display = "none";
@@ -407,23 +407,23 @@ function CroppingTool() {
 		self.slider_crop_top_z.update(
 			0,
 			0,
-			self.stack.slices,
-			self.stack.z,
+			self.stackViewer.primaryStack.slices,
+			self.stackViewer.z,
 			self.changeSliceDelayed );
 
 		self.slider_crop_bottom_z.update(
 			0,
 			0,
-			self.stack.slices,
-			self.stack.z,
+			self.stackViewer.primaryStack.slices,
+			self.stackViewer.z,
 			self.changeBottomSlice );
 
 		// initialize zoom-level slider
 		self.slider_crop_s.update(
-			self.stack.MAX_S,
+			self.stackViewer.primaryStack.MAX_S,
 			0,
-			(Math.abs(self.stack.MAX_S) + 1),
-			self.stack.s,
+			(Math.abs(self.stackViewer.primaryStack.MAX_S) + 1),
+			self.stackViewer.s,
 			self.changeScale,
 			-1);
 
@@ -436,7 +436,7 @@ function CroppingTool() {
 	};
 
 	/**
-	 * unregister all stack related mouse and keyboard controls
+	 * unregister all stack viewer related mouse and keyboard controls
 	 */
 	this.unregister = function()
 	{
@@ -493,5 +493,5 @@ function CroppingTool() {
 		return;
 	};
 }
-extend( CroppingTool, RoiTool );
+CATMAID.tools.extend( CroppingTool, RoiTool );
 

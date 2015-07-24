@@ -1,15 +1,60 @@
 import json
+import logging
 from string import upper
 
 from django.http import HttpResponse
+from django.contrib.auth.decorators import user_passes_test
 
-from catmaid.models import UserRole, Log
-from catmaid.control.authentication import requires_user_role 
+from catmaid.models import UserRole, Log, ReviewerWhitelist
+from catmaid.control.authentication import requires_user_role
+from catmaid.control.user import access_check
 
+@user_passes_test(access_check)
+def log_frontent_event(request, level='info'):
+    """ Logs events from the front end if a user is signed in or was assigned
+    browse permissions.
+    """
+    msg = request.POST.get('msg', None)
+    if not msg:
+        raise ValueError("No message given to log")
+
+    try:
+        logger = logging.getLogger('catmaid.frontend')
+        entry = "User: %s (%s) %s" % (
+            request.user.username, request.user.id, msg)
+        result = log(logger, level, entry)
+        status = "success"
+        status_msg = "Successfully created log entry"
+    except Exception, e:
+        status = "error"
+        status_msg = str(e)
+
+    return HttpResponse(json.dumps({
+        'status': status,
+        'message': status_msg
+    }))
+
+def log(logger, level, msg):
+    # Cancel silently if handler is not present
+    if not logger.handlers:
+        return
+
+    if "info" == level:
+        logger.info(msg)
+    elif "error" == level:
+        logger.error(msg)
+    elif "debug" == level:
+        logger.debug(msg)
+    else:
+        raise ValueError("Unknown level: " + level)
 
 @requires_user_role([UserRole.Annotate, UserRole.Browse])
 def list_logs(request, project_id=None):
-    user_id = int(request.POST.get('user_id', -1))  # We can see logs for different users
+    if 'user_id' in request.POST:
+        user_id = int(request.POST.get('user_id', -1))  # We can see logs for different users
+    else:
+        user_id = None
+    whitelist = bool(json.loads(request.POST.get('whitelist', 'false')))
     operation_type = request.POST.get('operation_type', "-1")
     search_freetext = request.POST.get('search_freetext', "")
     
@@ -29,8 +74,11 @@ def list_logs(request, project_id=None):
         sorting_cols = map(lambda i: fields[i], sorting_index)
 
     log_query = Log.objects.for_user(request.user).filter(project=project_id)
-    if user_id not in [-1, 0]:
+    if user_id:
         log_query = log_query.filter(user=user_id)
+    if whitelist:
+        log_query = log_query.filter(user_id__in=ReviewerWhitelist.objects.filter(
+                project_id=project_id, user_id=request.user.id).values_list('reviewer_id'))
     if not operation_type == "-1":
         log_query = log_query.filter(operation_type=operation_type)
     if not search_freetext == "":

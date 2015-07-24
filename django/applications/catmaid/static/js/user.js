@@ -26,6 +26,13 @@ function User(userID, login, fullName, firstName, lastName, color)
   return this;
 }
 
+User.prototype.getDisplayName = function () {
+  return this.fullName ? this.fullName : this.login;
+};
+
+User.displayNameCompare = function (a, b) {
+  return a.getDisplayName().localeCompare(b.getDisplayName());
+};
 
 User.prototype.users = {};
 
@@ -52,7 +59,7 @@ User.safe_get = function(id)
       firstName: 'unknown',
       lastName: 'unknown',
       color: new THREE.Color().setRGB(255, 0, 0),
-    }
+    };
   }
 };
 
@@ -93,8 +100,8 @@ User.getUsers = function(completionCallback)
         }
         else
         {
-          new ErrorDialog("The list of users could not be retrieved.",
-            text + "\n\n(Status: " + status + ")").show();
+          new CATMAID.ErrorDialog("The list of users could not be " +
+              "retrieved.", text + "\n\n(Status: " + status + ")").show();
         }
         if (completionCallback !== undefined) {
           completionCallback();
@@ -124,7 +131,7 @@ var Userprofile = function(profile) {
  */
 Userprofile.prototype.getOptions = function() {
   return {
-    inverse_mouse_wheel: false,
+    inverse_mouse_wheel: true,
     display_stack_reference_lines: true,
     independent_ontology_workspace_is_default: false,
     show_text_label_tool: false,
@@ -133,8 +140,11 @@ Userprofile.prototype.getOptions = function() {
     show_segmentation_tool: false,
     show_tracing_tool: false,
     show_ontology_tool: false,
+    show_roi_tool: false,
     tracing_overlay_screen_scaling: true,
-    tracing_overlay_scale: true
+    tracing_overlay_scale: true,
+    prefer_webgl_layers: true,
+    use_cursor_following_zoom: true
   };
 };
 
@@ -159,7 +169,8 @@ Userprofile.prototype.saveAll = function(success, error) {
         if (status == 200 && text) {
             var e = $.parseJSON(text);
             if (e.error) {
-              new ErrorDialog("Couldn't update user settings!", e.error).show();
+              new CATMAID.ErrorDialog("Couldn't update user settings!",
+                  e.error).show();
               if (error) {
                   error();
               }
@@ -167,8 +178,9 @@ Userprofile.prototype.saveAll = function(success, error) {
                 success();
             }
         } else {
-            new ErrorDialog("Couldn't update user settings!", "Updating the " +
-                "user profile returned an unexpected status: " + status).show();
+            new CATMAID.ErrorDialog("Couldn't update user settings!",
+                "Updating the user profile returned an unexpected status: " +
+                status).show();
             if (error) {
                 error();
             }

@@ -1,4 +1,4 @@
-.. _administering
+.. _administering:
 
 Administering a CATMAID instance
 ================================
@@ -83,6 +83,8 @@ thing. Those, however, don't ask for a password, but require a
 ``.pgpass`` file (see `PostgreSQL documentation
 <http://www.postgresql.org/docs/current/static/libpq-pgpass.html>`_).
 
+.. _performance-tuning:
+
 Performance tuning
 ------------------
 
@@ -120,6 +122,12 @@ Webserver
   to disk, especially if multiple users use CATMAID, can be a real performance
   hit.
 
+* Make use of the `SPDY <https://http://en.wikipedia.org/wiki/SPDY>`_ protocol.
+  Modern browsers and webservers support it and it only requires you to set up
+  SSL/TLS as an additional step before activating it. Through multiplexing,
+  compression and prioritization much better use of single connections. Requests
+  can be answered more quickly and CATMAID will feel more responsive.
+
 * A cache server like Varnish can be beneficial on the machine that serves the
   image data. If multiple users load the same image data, it will reduce the
   number of times image data has to be loaded from the hard drive.
@@ -128,7 +136,7 @@ Webserver
 
 * The webserver should mark image tiles to not expire so that they can be cached
   by a client. If the image data is public, one could let the webserver also set
-  the ``Cache-Control: public`` header for the images..
+  the ``Cache-Control: public`` header for the images.
 
 Database management system
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -145,6 +153,18 @@ Database management system
   also possible (and advisable) to automate this with by setting ``autovacuum =
   on`` in ``postgresql.conf``.
 
+* According to the `Django manual
+  <https://docs.djangoproject.com/en/1.6/ref/databases/#optimizing-postgresql-s-configuration>`_,
+  Django expects the following parameters for its database connections:
+  ``client_encoding: 'UTF8'``,  ``default_transaction_isolation: 'read committed'``
+  and ``timezone: 'UTC'`` when ``USE_TZ`` is True, value of ``TIME_ZONE``
+  otherwise (use of ``TIME_ZONE`` is CATMAID's default). All of these settings
+  can be configured in ``postgresql.conf`` or more conveniently per database
+  user with `ALTER ROLE <http://www.postgresql.org/docs/current/interactive/sql-alterrole.html>`_.
+  If these parameters are not the default, Django will do some additional
+  queries to set these parameters for each new connection.  Having those
+  defaults set will improve the database performance slightly.
+
 CATMAID
 ^^^^^^^
 
@@ -152,6 +172,21 @@ CATMAID
   ``django/projects/mysite``: It should contain ``DEBUG = False``. If you get a
   `Bad Request (400)` response, make sure you have set your ``ALLOWED_HOSTS``
   setting in the ``settings.py`` file correct.
+
+* Set `Django's <https://docs.djangoproject.com/en/1.6/ref/databases/#persistent-connections>`_
+  ``CONN_MAX_AGE`` option in the database settings of your ``settings.py`` file,
+  if you don't use a greenlet based threading model for your WSGI server's
+  workers (see `here <https://github.com/benoitc/gunicorn/issues/996>`_ for an
+  explanation). This setting controls how long (in seconds) a database
+  connection can be re-used. In the default configuration, this is set to ``0``,
+  which causes every request to use a new database connection. To test if this
+  setting can be used in your environment, set it to a value like ``60`` and
+  monitor the number of database connections (e.g. with ``SELECT count(*) FROM
+  pg_stat_activity;``). If this number matches your number of WSGI workers (plus
+  your own ``psql`` connection), everything is fine. If the number increases
+  over time, you should set ``CONN_MAX_AGE`` back to ``0``, because new
+  connections are apparently not closed anymore (which can happen with greenlet
+  based threading).
 
 Making CATMAID available through SSL
 ------------------------------------

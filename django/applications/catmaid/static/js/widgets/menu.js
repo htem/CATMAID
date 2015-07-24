@@ -57,7 +57,7 @@ Menu = function () {
           return false;
         };
       }
-      row.id = content[key].id;
+      if (typeof content[key].id !== 'undefined') row.id = content[key].id;
 
       //var icon = row.insertCell( -1 );
       var item = row.insertCell(-1);
@@ -121,5 +121,5 @@ Menu = function () {
   var view = document.createElement("div");
   view.className = "menu_text";
 
-  var pulldowns = new Object();
+  var pulldowns = {};
 };

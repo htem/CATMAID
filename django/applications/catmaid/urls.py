@@ -14,7 +14,8 @@ wordlist= r'\w+(,\w+)*'
 
 # Add the main index.html page at the root:
 urlpatterns = patterns('',
-    (r'^$', CatmaidView.as_view(template_name='catmaid/index.html'))
+    url(r'^$', CatmaidView.as_view(template_name='catmaid/index.html'),
+        name="home")
 )
 
 # Authentication and permissions
@@ -26,6 +27,7 @@ urlpatterns += patterns('catmaid.control.authentication',
     (r'^permissions$', 'user_project_permissions'),
     (r'^classinstance/(?P<ci_id>\d+)/permissions$',
             'get_object_permissions'),
+    (r'^register$', 'register'),
 )
 
 # Users
@@ -43,6 +45,7 @@ urlpatterns += patterns('django.contrib.auth.views',
 # Log
 urlpatterns += patterns('catmaid.control.log',
     (r'^(?P<project_id>\d+)/logs/list$', 'list_logs'),
+    (r'^log/(?P<level>(info|error|debug))$', 'log_frontent_event'),
 )
 
 # Messages
@@ -115,6 +118,7 @@ urlpatterns += patterns('catmaid.control.label',
     (r'^(?P<project_id>\d+)/labels-for-nodes$', 'labels_for_nodes'),
     (r'^(?P<project_id>\d+)/labels-for-node/(?P<ntype>(treenode|location|connector))/(?P<location_id>\d+)$', 'labels_for_node'),
     (r'^(?P<project_id>\d+)/label/(?P<ntype>(treenode|location|connector))/(?P<location_id>\d+)/update$', 'label_update'),
+    (r'^(?P<project_id>\d+)/label/(?P<ntype>(treenode|location|connector))/(?P<location_id>\d+)/remove$', 'remove_label_link'),
     (r'^(?P<project_id>\d+)/label/remove$', 'label_remove'),
 )
 
@@ -131,9 +135,11 @@ urlpatterns += patterns('catmaid.control.connector',
     (r'^(?P<project_id>\d+)/connector/table/list$', 'list_connector'),
     (r'^(?P<project_id>\d+)/connector/list/graphedge$', 'graphedge_list'),
     (r'^(?P<project_id>\d+)/connector/list/one_to_many$', 'one_to_many_synapses'),
+    (r'^(?P<project_id>\d+)/connector/list/many_to_many$', 'many_to_many_synapses'),
     (r'^(?P<project_id>\d+)/connector/list/completed$', 'list_completed'),
     (r'^(?P<project_id>\d+)/connector/skeletons$', 'connector_skeletons'),
     (r'^(?P<project_id>\d+)/connector/edgetimes$', 'connector_associated_edgetimes'),
+    (r'^(?P<project_id>\d+)/connector/pre-post-info$', 'connectors_info'),
 )
 
 # Neuron acess
@@ -153,6 +159,7 @@ urlpatterns += patterns('catmaid.control.node',
     (r'^(?P<project_id>\d+)/node/list$', 'node_list_tuples'),
     (r'^(?P<project_id>\d+)/node/previous_branch_or_root$', 'find_previous_branchnode_or_root'),
     (r'^(?P<project_id>\d+)/node/next_branch_or_end$', 'find_next_branchnode_or_end'),
+    (r'^(?P<project_id>\d+)/node/children$', 'find_children'),
     (r'^(?P<project_id>\d+)/node/get_location$', 'get_location'),
     (r'^(?P<project_id>\d+)/node/user-info$', 'user_info'),
 )
@@ -160,9 +167,10 @@ urlpatterns += patterns('catmaid.control.node',
 # Treenode access
 urlpatterns += patterns('catmaid.control.treenode',
     (r'^(?P<project_id>\d+)/treenode/create$', 'create_treenode'),
-    (r'^(?P<project_id>\d+)/treenode/create/interpolated$', 'create_interpolated_treenode'),
+    (r'^(?P<project_id>\d+)/treenode/insert$', 'insert_treenode'),
     (r'^(?P<project_id>\d+)/treenode/delete$', 'delete_treenode'),
     (r'^(?P<project_id>\d+)/treenode/info$', 'treenode_info'),
+    (r'^(?P<project_id>\d+)/treenode/(?P<treenode_id>\d+)/parent$', 'update_parent'),
     (r'^(?P<project_id>\d+)/treenode/(?P<treenode_id>\d+)/radius$', 'update_radius'),
 )
 
@@ -174,9 +182,11 @@ urlpatterns += patterns('catmaid.control.skeleton',
     (r'^(?P<project_id>\d+)/skeleton/node/(?P<treenode_id>\d+)/node_count$', 'node_count'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/review/reset-own$', 'reset_own_reviewer_ids'),
     (r'^(?P<project_id>\d+)/skeleton/connectivity$', 'skeleton_info_raw'),
+    (r'^(?P<project_id>\d+)/skeleton/connectivity_matrix$', 'connectivity_matrix'),
     (r'^(?P<project_id>\d+)/skeleton/review-status$', 'review_status'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/statistics$', 'skeleton_statistics'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/contributor_statistics$', 'contributor_statistics'),
+    (r'^(?P<project_id>\d+)/skeleton/contributor_statistics_multiple$', 'contributor_statistics_multiple'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/openleaf$', 'last_openleaf'),
     (r'^(?P<project_id>\d+)/skeleton/split$', 'split_skeleton'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/get-root$', 'root_for_skeleton'),
@@ -185,9 +195,8 @@ urlpatterns += patterns('catmaid.control.skeleton',
     (r'^(?P<project_id>\d+)/skeleton/reroot$', 'reroot_skeleton'),
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/permissions$',
             'get_skeleton_permissions'),
-    (r'^(?P<project_id>\d+)/skeleton/join_interpolated$', 'join_skeletons_interpolated'),
     (r'^(?P<project_id>\d+)/skeleton/annotationlist$', 'annotation_list'),
-    (r'^(?P<project_id>\d+)/skeleton/list$', 'list'),
+    (r'^(?P<project_id>\d+)/skeleton/list$', 'list_skeletons'),
 )
 
 # Skeleton export
@@ -204,6 +213,8 @@ urlpatterns += patterns('catmaid.control.skeletonexport',
     (r'^(?P<project_id>\d+)/skeleton/(?P<skeleton_id>\d+)/reviewed-nodes$', 'export_skeleton_reviews'),
     (r'^(?P<project_id>\d+)/skeletons/measure$', 'measure_skeletons'),
     (r'^(?P<project_id>\d+)/skeleton/connectors-by-partner$', 'skeleton_connectors_by_partner'),
+    (r'^(?P<project_id>\d+)/skeletons/within-spatial-distance$', 'within_spatial_distance'),
+    (r'^(?P<project_id>\d+)/skeletons/partners-by-connector$', 'partners_by_connector'),
 )
 
 # Skeleton group access
@@ -360,6 +371,8 @@ urlpatterns += patterns('catmaid.control.roi',
         'remove_roi_link', name='remove_roi_link'),
     url(r'^(?P<project_id>{0})/roi/(?P<roi_id>{0})/image$'.format(integer),
         'get_roi_image', name='get_roi_image'),
+    url(r'^(?P<project_id>{0})/roi/add$'.format(integer),
+        'add_roi', name='add_roi'),
 )
 
 # Clustering
@@ -398,6 +411,9 @@ urlpatterns += patterns('catmaid.control',
     # Analytics
     (r'^(?P<project_id>\d+)/skeleton/analytics$', 'analytics.analyze_skeletons'),
 
+    # Review
+    (r'^(?P<project_id>\d+)/user/reviewer-whitelist$', 'review.reviewer_whitelist'),
+
     # Search
     (r'^(?P<project_id>\d+)/search$', 'search.search'),
 
@@ -409,6 +425,12 @@ urlpatterns += patterns('catmaid.control',
     (r'^(?P<project_id>\d+)/annotationdiagram/nx_json$', 'object.convert_annotations_to_networkx'),
 
     # Treenode table
-    (r'^(?P<project_id>\d+)/treenode/table/list$', 'treenodetable.list_treenode_table'),
-    (r'^(?P<project_id>\d+)/treenode/table/update$', 'treenodetable.update_treenode_table'),
+    (r'^(?P<project_id>\d+)/treenode/table/(?P<skid>\d+)/content$', 'treenodetable.treenode_table_content'),
+)
+
+# Patterns for FlyTEM access
+urlpatterns += patterns('catmaid.control.flytem',
+    (r'^flytem/projects$', 'project.projects'),
+    (r'^flytem/(?P<project_id>.+)/stack/(?P<stack_id>.+)/info$', 'stack.stack_info'),
+    (r'^flytem/(?P<project_id>.+)/stacks$', 'stack.stacks'),
 )

@@ -36,9 +36,8 @@ var ClassificationEditor = new function()
      */
     this.load_classification = function(pid, completionCallback) {
         requestQueue.register(self.get_cls_url(pid, '/show'),
-            'GET', undefined, self.create_error_aware_callback(
-                function(status, data, text) {
-                    var e = $.parseJSON(data);
+            'GET', undefined, CATMAID.jsonResponseHandler(
+                function(e) {
                     if (e.error) {
                         alert(e.error);
                     } else {
@@ -99,7 +98,7 @@ var ClassificationEditor = new function()
             });
 
         var url = self.get_cls_url(pid, '/list');
-        if (link_id != null) {
+        if (link_id != null) { // jshint ignore:line
             url += "/" + link_id;
         }
 
@@ -229,7 +228,7 @@ var ClassificationEditor = new function()
                             // Add entry and submenu for removing a region of interest
                             var rois = JSON.parse(obj.attr("rois"));
                             var submenu = {};
-                            for (i=0; i<rois.length; i++) {
+                            for (var i=0; i<rois.length; i++) {
                                 var roi = rois[i];
                                 submenu['remove_roi_' + roi] = {
                                     "separator_before": false,
@@ -247,7 +246,7 @@ var ClassificationEditor = new function()
                                 "separator_after": false,
                                 "label": "Remove region of interest",
                                 "_class": "wider-context-menu",
-                                "_disabled": rois.length == 0,
+                                "_disabled": rois.length === 0,
                                 "submenu": submenu,
                             };
 
@@ -316,10 +315,10 @@ var ClassificationEditor = new function()
         });
 
         // handlers
-        //	"inst" : /* the actual tree instance */,
-        //	"args" : /* arguments passed to the function */,
-        //	"rslt" : /* any data the function passed to the event */,
-        //	"rlbk" : /* an optional rollback object - it is not always present */
+        //  "inst" : /* the actual tree instance */,
+        //  "args" : /* arguments passed to the function */,
+        //  "rslt" : /* any data the function passed to the event */,
+        //  "rlbk" : /* an optional rollback object - it is not always present */
 
         // react to the opening of a node
         tree.bind("open_node.jstree", function (e, data) {
@@ -410,7 +409,7 @@ var ClassificationEditor = new function()
                 if(r['status']) {
                     $("#annotation_graph_object").jstree("refresh", -1);
                     project.updateTool();
-                    growlAlert('SUCCESS',
+                    CATMAID.msg('SUCCESS',
                         'Classification graph element "' + friendly_name + '" removed.');
                 }
             });
@@ -441,7 +440,7 @@ var ClassificationEditor = new function()
                 if(r['status']) {
                     $("#annotation_graph_object").jstree("refresh", -1);
                     project.updateTool();
-                    growlAlert('SUCCESS', 'Classification graph element renamed.');
+                    CATMAID.msg('SUCCESS', 'Classification graph element renamed.');
                 }
             });
         });
@@ -460,8 +459,7 @@ var ClassificationEditor = new function()
         // Open Roi tool and register it with current stack. Bind own method
         // to apply button.
         var tool = new RoiTool();
-        tool.button_roi_apply.onclick = function()
-        {
+        tool.button_roi_apply.onclick = function() {
             // Collect relevant information
             var cb = tool.getCropBox();
             var data = {
@@ -469,30 +467,29 @@ var ClassificationEditor = new function()
                 x_max: cb.right,
                 y_min: cb.top,
                 y_max: cb.bottom,
-                z: tool.stack.z * tool.stack.resolution.z + tool.stack.translation.z,
-                zoom_level: tool.stack.s,
+                z: tool.stackViewer.z * tool.stackViewer.primaryStack.resolution.z + tool.stackViewer.primaryStack.translation.z,
+                zoom_level: tool.stackViewer.s,
                 rotation_cw: cb.rotation_cw
             };
             // The actual creation and linking of the ROI happens in
             // the back-end. Create URL for initiating this:
             var roi_url = self.get_cls_url(project.id,
-                "/stack/" + tool.stack.getId() + "/linkroi/" + node_id + "/");
+                "/stack/" + tool.stackViewer.primaryStack.id + "/linkroi/" + node_id + "/");
             // Make Ajax call and handle response in callback
             requestQueue.register(roi_url, 'POST', data,
-                self.create_error_aware_callback(
-                    function(status, text, xml) {
-                        var result = $.parseJSON(text);
-                        if (result.status) {
-                            self.show_status("Success", result.status);
+                CATMAID.jsonResponseHandler(
+                    function(json) {
+                        if (json.status) {
+                            self.show_status("Success", json.status);
                         } else {
-                            alert("The server returned an unexpected response.");
+                            CATMAID.error("The server returned an unexpected response.");
                         }
                         $(tree_id).jstree("refresh", -1);
                     }));
-
-            // Open the navigator tool as replacement
-            project.setTool( new Navigator() );
         };
+
+        // Open the navigator tool as replacement
+        project.setTool( new Navigator() );
 
         // Create a cancel button
         var cancel_button = document.createElement("div");
@@ -511,8 +508,8 @@ var ClassificationEditor = new function()
         cancel_button.appendChild(cancel_link);
 
         // Add cancel button to toolbar
-	    var toolbar = document.getElementById("toolbar_roi");
-	    var toolbar_button = document.getElementById("button_roi_apply").parentNode;
+        var toolbar = document.getElementById("toolbar_roi");
+        var toolbar_button = document.getElementById("button_roi_apply").parentNode;
         toolbar.insertBefore(cancel_button, toolbar_button.nextSibling);
 
         // Make sure the cancel button gets removed
@@ -918,11 +915,11 @@ var ClassificationEditor = new function()
     };
 
     /**
-     * Shows a growl error message in the top right corner.
+     * Shows status information.
      */
     this.show_status = function( title, message, delaytime ) {
         if (!delaytime)
             delaytime = 2500;
-        growlAlert(title, message, {duration: delaytime});
+        CATMAID.msg(title, message, {duration: delaytime});
     };
 }();

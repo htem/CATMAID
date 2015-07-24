@@ -18,7 +18,7 @@ Introduction
 
 The most fundamental dependencies of CATMAID are:
 
-1. PostgreSQL >= 9.2
+1. PostgreSQL >= 9.3
 2. Python 2.7
 3. Imagemagick (for generating image tiles)
 
@@ -39,33 +39,42 @@ up one of these web servers is described in later sections.
 1. Clone the repository
 #######################
 
-The git repository is hosted at `https://github.com/acardona/CATMAID
-<https://github.com/acardona/CATMAID>`_  - clone this repository
+The git repository is hosted at `https://github.com/catmaid/CATMAID
+<https://github.com/catmaid/CATMAID>`_  - clone this repository
 somewhere outside your web root, e.g. in ``/home/alice``, so that
 the source code is in ``/home/alice/catmaid``::
 
-   git clone https://github.com/acardona/CATMAID.git catmaid
+   git clone https://github.com/catmaid/CATMAID.git catmaid
 
 2. Install required Python packages
 ###################################
 
-We recommend the use of Python 2.7. CATMAID is likely to run
-with Python 2.6 as well, but Python 2.7 is used for development
-and testing.
+We recommend the use of Python 2.7. CATMAID is likely to run with Python 2.6 as
+well, but Python 2.7 is used for development and testing.
 
-We strongly recommend that you install all Python package
-dependencies into a virtualenv, so that they are isolated from
-the system-wide installed packages and can be upgraded easily.
-Some of these Python packages depend on system-wide libraries
-that you will need to install in advance, however.  You can do
-this with::
+We strongly recommend that you install all Python package dependencies into a
+virtualenv, so that they are isolated from the system-wide installed packages
+and can be upgraded easily.  Some of these Python packages depend on system-wide
+libraries that you will need to install in advance, however. You can do this
+with one of the following commands (the one suiting best your OS):
 
-    sudo apt-get install gcc gfortran apt-file python2.7-dev postgresql-common \
-                         libpq-dev libgraphicsmagick++1-dev graphicsmagick \
-                         libhdf5-serial-dev libboost1.55-dev virtualenvwrapper \
-                         libboost-python1.55-dev uuid-dev libxml2-dev \
-                         libxslt1-dev libjpeg-dev libtiff-dev libblas-dev \
-                         liblapack-dev
+Ubuntu 14.04:
+
+    .. fileinclude:: ../../packagelist-ubuntu-14.04-apt.txt
+       :removelinebreaks:
+       :indent:
+       :prepend: sudo apt-get install
+       :split: 75
+       :splitend:  \
+
+Ubuntu 12.04:
+
+    .. fileinclude:: ../../packagelist-ubuntu-12.04-apt.txt
+       :removelinebreaks:
+       :indent:
+       :prepend: sudo apt-get install
+       :split: 75
+       :splitend:  \
 
 Virtualenv Wrapper needs to source your environment. Start a new terminal
 or if you are using the bash::
@@ -134,8 +143,9 @@ supports tiff (check e.g. with the help of "gm convert -list format").
 
 If you are comfortable with creating a new PostgreSQL database
 for CATMAID, then you should do that and continue to the next
-section.  The advice here is a suggested approach for people
-who are unsure what to do.
+section. If you decide to do so, please make sure to also install the
+``postgis`` extension for the new CATMAID database. The advice here is a
+suggested approach for people who are unsure what to do.
 
 If you are uncomfortable with using the PostgreSQL interactive
 terminal from the command line, you may wish to install an
@@ -155,7 +165,7 @@ slightly different version for you) and add this line as the
 
 After saving that file, you need to restart PostgreSQL with::
 
-    sudo /etc/init.d/postgresql restart
+    sudo service postgresql restart
 
 You can generate the commands for creating the database and
 database user with the ``scripts/createuser.sh`` helper script.
@@ -167,8 +177,9 @@ user with, for example::
 
     scripts/createuser.sh catmaid catmaid_user p4ssw0rd | sudo -u postgres psql
 
-You should now be able to access the database and see that it is
-currently empty, e.g.::
+Besides createing the database and the database user, it will also enable a
+required Postgres extension, called ``postgis``. You should now be able to
+access the database and see that it is currently empty, e.g.::
 
     psql -U catmaid_user catmaid
     Password:
@@ -264,10 +275,18 @@ You have various options for setting up CATMAID with a
 production webserver - you can choose from (at least) the
 following options:
 
-1. Apache + mod_wsgi, in which case see :ref:`apache`
-
-2. Nginx and either gevent, uWSGI or Gunicorn, in which case see
+1. Nginx and either gevent, uWSGI or Gunicorn, in which case see
    :ref:`alternative-install`
+
+2. Apache + mod_wsgi, in which case see :ref:`apache`
+
+We usually prefer to use Nginx because of a more straight-forward configuration,
+smaller memory footprint and better performance with Gunicorn.
+
+In general you want to fine-tune your setup to improve performance. Please have
+a look at our :ref:`collection of advice <performance-tuning>` for the various
+infrastructure parts (e.g.  webserver, database, file system). This can really
+make a difference.
 
 11. Using the admin interface
 #############################

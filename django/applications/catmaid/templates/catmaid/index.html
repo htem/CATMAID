@@ -1,28 +1,35 @@
 {% load compressed %}
+{% load common %}
 
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
+<!DOCTYPE html>
+<html class="mod-no-js">
 	<head>
-		<title>CATMAID v0.24</title>
+		<meta charset="UTF-8">
+		<title>CATMAID</title>
 
 		<script type="text/javascript">
 			var STATIC_URL_JS = '{{ STATIC_URL|escapejs }}';
-			var IE = false;
 			var django_url = "{{ CATMAID_URL }}";
 		</script>
 
 		<!--[if gte IE 5]>
 		<script type="text/javascript" src="{{ STATIC_URL }}libs/excanvas/excanvas.js"></script>
-		<script type="text/javascript">var IE = true;</script>
 		<![endif]-->
 
 		{% compressed_css 'libraries' %}
 		{% compressed_css 'catmaid' %}
 
     {% for f in JS_FILES %}
+		{% if f == 'arbor' %}
+			<script type="text/javascript" src="{{ STATIC_URL }}libs/cytoscapejs/arbor.js"></script>
+		{% else %}
 		  {% compressed_js f %}
+		{% endif %}
     {% endfor %}
+
+		<script type="text/javascript">
+			CATMAID.configure("{{ CATMAID_URL }}", "{{ STATIC_URL|escapejs }}");
+		</script>
 	</head>
 	<body onload="realInit();"><a></a>
 		<!-- Toolbars
@@ -68,7 +75,7 @@
 				<div id="session_box" class="box_right" style="display:none">
 					<div class="menu_item" onmouseover="this.lastChild.style.display = 'block';"
 							 onmouseout="this.lastChild.style.display = 'none';">
-						<p id="message_menu_text"><a>You are <span id="session_longname">&nbsp;</span>.</a></p>
+						<p><a>You are <span id="session_longname">&nbsp;</span>.</a></p>
 						<div class="pulldown" id="user_menu"></div></div>
 				</div>
 				</div>
@@ -90,7 +97,6 @@
 				<div class="box"><p>y&nbsp;</p><p><input type="text" id="y" name="y" size="5" /><img src="{{ STATIC_URL }}images/input_topdown.svg" onerror="this.onerror = null; this.src = '{{ STATIC_URL }}images/input_topdown.gif'" alt="" usemap="#ymap" /></p></div>
 				<div id="sliders_box"></div>
 				<div class="box" id="zoom_level_box"><p>zoom-level</p><div id="slider_s"></div><p>&nbsp;&nbsp;</p></div>
-				<div class="box"><p><input type="checkbox" id="displayreflines" name="displayreflines" checked="checked" /></p><p><label for="displayreflines">display reference lines</label></p></div>
 				<div class="box_right"><p><a id="a_url" name="a_url" title="This is the URL to this view. You can bookmark it or send it to the people." href="" target="_blank">URL to this view</a></p></div>
 				<div class="toolbar_fill"></div>
 			</div>
@@ -176,7 +182,7 @@
 		<div id="content">
 			<div id="data_view"></div>
 			<div id="clientside_data_view">
-				<h1>CATMAID v0.24</h1>
+				<h1 title="Version: {% catmaid_version %}">CATMAID</h1>
 				<div id="project_list">
 
 					<p>Please feel free to open one of the public projects or log in with your account and password.</p>

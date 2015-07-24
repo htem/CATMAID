@@ -13,12 +13,12 @@
  */
 
 /**
- * Implements a cross browser HTTPrequest-FIFO-queue as `singleton module'
+ * Implements a cross browser HTTPrequest-FIFO-queue.
  */
-var requestQueue = function()
+RequestQueue = function()
 {
   var self = this;
-  var queue = new Array();		//!< queue of waiting requests
+  var queue = [];		//!< queue of waiting requests
   var xmlHttp;
   var spinner = null;
 
@@ -29,10 +29,10 @@ var requestQueue = function()
   else
   {
     try { xmlHttp = new ActiveXObject( "Msxml2.XMLHTTP" ); }
-    catch( e )
+    catch( error )
     {
       try { xmlHttp = new ActiveXObject( "Microsoft.XMLHTTP" ); }
-      catch( e ){ xmlHttp = null; }
+      catch( error2 ){ xmlHttp = null; }
     }
   }
 
@@ -178,11 +178,11 @@ var requestQueue = function()
         );
         break;
       default:
-	var request = "";
-	var encoded = encodeObject( d );
-	if (encoded != "") {
-		request = "?" + encoded;
-	}
+  var request = "";
+  var encoded = encodeObject( d );
+  if (encoded !== "") {
+    request = "?" + encoded;
+  }
         queue.push(
           {
             request : r + request,
@@ -220,15 +220,13 @@ var requestQueue = function()
         if ( queue[ i ].id == id )
         {
           removedRequest = queue.splice( i, 1 );
-          statusBar.replaceLast( "replacing request ", + r );
+          CATMAID.statusBar.replaceLast( "replacing request ", + r );
           // Send a distinguishable error reponse with the callback:
           removedRequest[0].callback(200, JSON.stringify({'error': 'REPLACED'}), null);
         }
       }
       this.register( r, m, d, c, id );
-      // statusBar.replaceLast( "queue.length = " + queue.length );
       return;
     }
   };
-
-}();
+};
